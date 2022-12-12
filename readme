@@ -1,0 +1,2 @@
+echo "Enter <cmd> -h for specific help for program"
+grep 'NAME' ~/bin/* | grep -v readme | sed -e 's/^\/home\/Owner\/bin\/.*# NAME //' 

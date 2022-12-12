@@ -1,0 +1,119 @@
+#!/bin/bash
+########################################################################
+#
+# NAME  unpk - unpack an SCO or Backup package for import into Obsidian
+#
+# DESCRIPTION Chamilo exports SCO zip files that we want to import
+#      into Obsidian. Most content files are fine except for html files.
+#      These need to be converted to markdown before transferring into
+#      the vault.
+#
+  USAGE="unpk [-h] [-d] <scoFile> <vaultFolder> <lpFolder>
+  Where:
+    -h          = help
+    -d          = debug
+    scoFile     = full path to .zip file
+    vaultFolder = full path spec to obsidian vault
+    lpFolder    = path below course
+    
+  Ex: unpk '/tmp/sco.zip' \
+           'c:/<myVault>/Majors/Training/Courses/Practice-Course' \
+           'Documents/Learning_Paths/<lpPath>' "
+#
+#
+########################################################################
+
+function ifBug {
+  if [ "x$bug" != "x" ] ; then
+    echo "$*"
+  fi
+}
+
+
+pid=$$
+PATH=$PATH:`pwd`
+bug=
+
+
+while [ $# -gt 0 ] ; do # decode CL
+  case $1 in
+    -h|--help) cat $0 | helper ; exit ;;
+    -d) bug="sh -x " 
+        set -x
+        ;;
+    
+    *)
+      if [ $# -lt 3 ] ; then
+        echo "Missing args. Usage: $USAGE"
+        exit
+      fi
+    
+      filePath=$1
+      vaultPath=$2
+      lp="$3"
+      shift 3
+      
+      if [ $# -gt 0 ] ; then
+        echo "Unrecognized parameter: $1 Usage: $USAGE" 
+        exit
+      fi      
+      ;;
+  esac
+
+  shift
+done
+
+if [ -e "$filePath" ] ; then
+  tgt=/tmp/sco$pid
+  mkdir -p $tgt
+  unzip $filePath -d $tgt
+ 
+  mkdir -p $vaultPath
+  cd $tgt
+
+  du -a . | while read sz file ; do
+    if [ -d $file ] ; then
+      continue
+    fi
+
+# for backups
+# From:  <cwd>      document/learning_path/<lp>/<f>
+#   To: <vaultPath>/Documents/Learning_Paths/<lp>/<f>
+
+    fle=${file:1}
+    f="${fle/\/document\/learning_path/}"  # backups are structured with lp
+    f="${f/\/document/}"                   # sco is structured without lp
+    base=`basename $fle`
+    mkdir -p "$vaultPath/Images"
+    mkdir -p "$vaultPath/Audio"
+    mkdir -p "$vaultPath/Video"
+    
+    case "$file" in
+      .|..|*zip|*/upload/*) ifBug "Ignore: $fle" ;;
+      *png|*gif|*jpg) cp $file "$vaultPath/Images/$base" ;;
+      *mp4)           cp $file "$vaultPath/Video/$base"  ;;
+      *m4a)           cp $file "$vaultPath/Audio/$base"  ;;
+      
+      *xsd|*xml|*assets*|*index.html) 
+        ifBug "Copy to root: $fle"
+        mkdir -p "${vaultPath}/Scorm/${fle%/*}"
+        cp $file "${vaultPath}/Scorm/${fle}" 
+        ;;
+
+      *html)     
+        ifBug "Process: $fle"
+        mkdir -p "${vaultPath}/$lp${f%/*}"
+        cat $file | $bug declude | iconv -f UTF8 -t UTF8 -c | $bug cvt h2m > "${vaultPath}/$lp${f%.html}.md" 
+        ;;
+        
+      *) # pdf pptx
+        ifBug "copy: $fle"
+        mkdir -p "${vaultPath}/$lp${f%/*}"
+        cp $file "${vaultPath}/$lp$f" 
+        ;;
+    esac
+  done
+
+  # rm -rf $tgt
+fi
+

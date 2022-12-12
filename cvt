@@ -1,0 +1,98 @@
+#!/bin/bash
+#########################################################################
+#
+# NAME  cvt  -  convert various file formats from stdin to stdout
+#
+# DESCRIPTION mostly a shorthand for various file conversions intended
+#      to be inline piped from and to other transformations
+#
+  USAGE=" ...| $0 <formats> [<other>] |...
+  Where 
+    formats are:
+      -h   - this file
+      d2j  - dat file to json
+      m2t  - markdown to tab separated values
+      t2m  - tab separated values to markdown 
+      h2m  - hypertext markup language to markdown
+      h2f  - html to formatted
+      m2h  - markdown to hypertext markup language
+      m2ht - markdown to html using template
+      c2j  - csv to json
+      t2j  - tsv to json
+    other args are passed to formatters
+  "
+#
+#########################################################################
+
+
+function deQuote {      # Remove fancy quotes
+  sed -e "s/[‘’]/\'/g;s/[“”]/\'/g;s/&rsquo;/\'/g;s/&lsquo;/\'/g" 
+}
+
+
+function escQuote {     # escape double quotes
+  sed -e "s/\"/\'/g"
+  #sed -e 's/xxx//g;'
+}
+  
+  
+function deNul {        # get rid of leading \ in lines pandoc thinks these are line breaks 
+  sed -e 's/^\\//'
+}
+
+  
+function deStyle {
+  sed -e 's/ style="[^"]*"//g'
+}
+  
+
+function getInfo {        # <attr> <file> get config info for o2c
+  look=$1
+  path="$2"
+  set x `grep -e  "^$1 " "$2" | grep -v '#'` 
+  shift ; shift
+  
+  if [ $# -eq 0 ] ; then
+    echo  "Config is missing: $look in: $path. Continuing." >&2
+  fi
+  
+  echo $*
+}
+
+
+function deId {
+  sed -e 's/ id="[^"]*"//g'
+  #sed -e 's/xxx//g'
+}
+
+
+function deAlert {
+  sed -e 's/{.*alert-warning.*}//g'
+  #sed -e 's/xxx//g'
+}
+
+
+PATH=$PATH:`pwd`
+export PATH
+
+op=$1
+shift
+
+case $op in
+  -h|--help) cat $0 | helper ;;
+  d2j)    base64 -d  ;;
+  m2t)    md2tsv ;;
+  t2m)    mlr --itsv --omd cat ;;
+  h2m)    pandoc -f html -t markdown $* ;;
+  h2f)    tidy -i -omit -utf8 -w 200 $* ;;
+  m2h)    pandoc -f markdown -t html $* | deNul | deId | deStyle | deQuote | escQuote | deAlert ;;
+  m2ht)   vault=`getInfo vault ~/.o2c.config`
+          template=`getInfo template ~/.o2c.config`
+          pandoc -f markdown -t html --template "$vault/Templates/$template" $* ;; 
+  c2j)    mlr --icsv --ojson cat ;;
+  t2j)    mlr --itsv --ojson cat ;;
+  *)      echo "Invalid Command: $1 
+  Usage: $USAGE" ;;
+esac
+
+

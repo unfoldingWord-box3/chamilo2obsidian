@@ -1,0 +1,36 @@
+#!/bin/bash
+########################################################################
+#
+# NAME  helper - grep first comment block from script
+#
+########################################################################
+in=no
+
+while read -r ln ; do
+  case $in in
+    no)
+      case "$ln" in
+        '#####'*) 
+          in=yes
+          echo "$ln"
+          ;;
+
+        *)
+          ;;
+       esac 
+      ;;
+
+    yes)
+      case "$ln" in
+        '#####'*)
+          echo "$ln"
+          exit
+          ;;
+
+        *)
+          echo "$ln"
+          ;;
+      esac
+      ;;
+  esac
+done | more

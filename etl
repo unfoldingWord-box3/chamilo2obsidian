@@ -1,0 +1,479 @@
+#!/bin/sh
+########################################################################
+#
+# NAME  etl - Extract markdown files, convert to html then package SCO
+#
+# DESCRIPTION  Walk through all .md files in an Obsidian vault path.  
+#    Run each file through pandoc to convert md to html Post process 
+#    with sed to clean up nits. Copy pptx and images directly
+#
+  USAGE="$0 [-d] [-h] [-z] <vaultPath> <course> <version> <maxScore>
+  Ex:
+    sh -x $0 '/cygdrive/k/team/unfoldingword.mdm/uW Content Library/Training Modules' uW_Training 0.1.0
+        ./$0 '/cygdrive/c/SpidelRoot/Training Modules' uW_Training 0.1.0
+
+  Results will be placed in folder named TMPSCORM as child of vaultPath"
+#
+# TBD What is knitting algorithm
+#   Identify all courses in vault
+#     curricula.md contains list of courses
+#     courses.xlsx contains list of all courses
+#   Identify all quizes
+#     quizes.xlsx
+#   Convert all markdown files to html
+#   Generate manifests for each course
+#   Generate all SCOs
+#
+# TBD How to treat slides
+# find transcluded files
+# TBD Do images with space in name get imported?
+# TBD Where are images
+# TBD Where are resources
+# TBD How to make Folders
+#
+# OBS quizes in chamilo format
+# OBS Quizes imported independently
+# OBS Categories imported with course names 
+#
+# does support pptx
+# folder is learning path
+# embedded html links point ./
+# embedded md links change to html
+#
+# ASSUMPTIONS
+#      Folders and Files are alpha ordered
+#      Folders structured as
+#        usecase (How, Role, troubleshoot, BPF)
+#          Role (organization)
+#            Skill (course)
+#              Task (class) 
+#
+# ALGORITHM
+#      Walk through all markdown files
+#        Make parent be course name
+#        convert md to html with pandoc
+#        convert resource links to img refs
+#        add doc to items and resources list
+#
+# SEE ALSO 
+#     etl.sed   - sed scripts for pandoc assist
+#     tsv2md    - convert tsv to markdown 
+#     md2tsv    - convert markdown to tsv
+#        
+########################################################################
+
+
+function getInfo {        # <attr> <file> get config info for c2o
+  look=$1
+  path="$2"
+  set x `grep -e  "^$look " "$path" | grep -v '#'`
+  shift ; shift
+  
+  if [ $# -eq 0 ] ; then
+    echo  "Config is missing: $look in: $path. Continuing." >&2
+  fi
+  
+  echo $*
+}
+
+
+function getToken {       # given user credentials, obtain security token
+  usr=`getInfo user ~/.c2o.config`
+  pwd=`getInfo pswd ~/.c2o.config`
+
+  curl -s -X 'POST' "$host/$api/auth" \
+  -H 'accept: */*' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "username": "'$usr'",
+    "password": "'$pwd'"
+  }' | jq -r '.token' 
+}
+
+
+function gettr {          # boilerplate for parameterless GET endpoints
+  endpoint=$1
+  opt=$2
+   
+  if [ "x$opt" = xc ] ; then
+    c="-H 'Content-Type: application/json'"
+  else
+    c=
+  fi
+  
+  curl -s -X 'GET' \
+    "$host/$api/$endpoint" \
+    -H 'accept: */*' \
+    -H "Authorization: Bearer $token" \
+    $c # courses does not like it
+}
+
+
+function getCourseCodes {  # get course code and id from course name
+#  firstVal='s/^[^:]*:"//;s/".*$//'
+  course="$*"
+  set x `gettr courses c | jq -cr '.[] | { code, id, title }' | $mlrP | grep "$course"`
+#  set x `echo "$courses" | grep "\"$course\"" | $mlrP`
+  shift
+  cc=$1
+  cId=$2
+  
+  if [ "x$cc" = x ] ; then
+    logError "getCourseCode: No such course: $course"
+  fi
+set +x
+  echo $cc $cId
+}
+
+
+function logError {       # display error and USAGE then exit script
+  op=$1
+  shift
+  echo $*
+  echo
+  echo "USAGE: $USAGE"
+  
+  if [ "$op" != "--" ] ; then
+    grep "$op" ~/bin/c2o
+  fi
+  
+  exit
+}
+
+
+function makeManifest {   # <id> <version> <resList> - create manifest for sco file
+  # having constructed list of files to include in manifest
+  # create manifist file including them all as references
+  id="$1"
+  ver=$2
+  resList="$3"
+  
+  ttl=TBD
+  hrf=TBD
+  
+  # this is boilerplate for sco item
+  atr="  <adlcp:prerequisites type=\"aicc_script\" />
+        <adlcp:masteryscore>-1</adlcp:masteryscore>"
+
+  fle=TBD
+  tmpRes=
+  tmpItm=
+#  id=10
+  old="x"
+  xmlBase="."
+
+  while read r ; do
+    args="$r"
+    pth="${r%%:*}"   # separate r on :
+    nme="${pth:2}"
+    rut="${nme%/*}"  # remove subdirectories
+    stl="${r##*:}"
+    ttl="${stl##*\/}"
+    isRes=no
+
+    case $pth in
+      *Resources*) 
+        fle="${rut}/Resources/${ttl}" 
+        isRes=yes
+        ;;
+      *) fle="${rut}/${ttl}" ;;
+    esac
+
+    fle="${fle// /_}"
+
+  # place each folder in its own organization
+    if [ "$old" = x ] ; then
+      tmpItm="<organization identifier=\"${rut}\">
+      <title> $rut </title>"
+      old="$rut"
+
+    elif [ "$old" != "$rut" ] ; then
+      tmpItm="$tmpItm
+    </organization>
+    <organization identifier=\"${rut}\">
+      <title> $rut </title>"
+      old="$rut"
+    fi
+
+    scormType="asset"
+
+#     if [ $isRes = no ] ; then
+      #scormType="sco"
+      tmpItm="$tmpItm
+      <item 
+          identifier=\"ITEM_${id}\"
+          identifierref=\"RESOURCE_${id}\"
+          isvisible=\"true\" 
+      >
+        <title> ${ttl/%.md} </title>
+        $atr
+      </item>"
+#     fi
+
+  # check for dependency
+    isDep=no 
+
+    if [ $isDep = yes ] ; then
+      dep="
+      <dependency identifierref=\"\" />"
+    fi
+
+    # point to files having been imported per reference
+    filePath="$xmlBase/${fle/%md/html}"
+
+    tmpRes="$tmpRes 
+    <resource 
+        identifier=\"RESOURCE_${id}\" 
+        type=\"webcontent\"
+        xml:base=\"\"
+        adlcp:scormtype=\"$scormType\"
+        href=\"${filePath// /_}\"
+    > $dep 
+      <file href=\"${filePath// /_}\" /> 
+    </resource>"
+    (( id++ ))
+#    id=$(( $id + 1 ))
+  done < $resList
+
+  tmpItm="$tmpItm
+  </organization>"
+
+#    <!-- lom:lom>
+#      <lom:general>     <lom:title> <lom:langstring> $courseId </lom:langstring> </lom:title> </lom:general>
+#      <lom:educational> <lom:typicallearningtime> <lom:datetime>00:00:00</lom:datetime></lom: typicallearningtime> </lom:educational>
+#    </lom:lom -->
+
+#    xmlns:lom=\"http://www.imsglobal.org/xsd/imsmd_rootv1p2p1\" 
+
+  echo "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<manifest 
+    xmlns=\"http://www.imsproject.org/xsd/imscp_rootv1p1p2\" 
+    identifier=\"CourseManifest\"
+    version=\"$ver\" 
+    xmlns:adlcp=\"http://www.adlnet.org/xsd/adlcp_rootv1p2\" 
+    xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" 
+    xsi:schemaLocation=\"http://www.imsproject.org/xsd/imscp_rootv1p1p2 imscp_rootv1p1p2.xsd http://www.imsglobal.org/xsd/imsmd_rootv1p2p1 imsmd_rootv1p2p1.xsd http://www.adlnet.org/xsd/adlcp_rootv1p2 adlcp_rootv1p2.xsd\" >
+  <metadata>
+    <schema>ADL SCORM</schema>
+    <schemaversion>1.2</schemaversion>
+  </metadata>
+
+  <organizations default=\"${courseId}_organization\">
+    $tmpItm 
+  </organizations>
+
+  <resources>
+    $tmpRes
+  </resources>
+</manifest>"
+
+}
+
+
+function puttz {          # upload a SCORM file (sco.zip)
+  endpoint="$1"
+  zipRef="$2"
+  maxScore="$3"
+  pwd
+  
+  curl -X 'POST' "$host/$api/$endpoint" \
+    -H 'accept: */*' \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: multipart/form-data" \
+    -F "scormUpload=@$zipRef;type=application/x-zip-compressed" \
+    -F "use_max_score=$maxScore"
+}
+
+
+function zipit {          # <cc> <maxScore> - zip and upload to chamilo
+  cc=$1
+  max=$2
+  
+  cd TMPSCORM
+  zip -r ../sco.zip *
+  cd ..
+  puttz course/$cc/learningpath/scorm sco.zip $2   
+}
+
+
+# set environment like c2o
+  zip=no
+  init=no
+  update=no
+  repoToFolder=no
+
+  mlr="mlr --ijson --o"
+  mlrC="${mlr}csv    cat"
+  mlrP="${mlr}pprint cat"
+  
+  host=`getInfo host  ~/.c2o.config`
+  api=`getInfo api   ~/.c2o.config`
+  token=`getToken`
+  debug=no
+
+# process positional parameters
+  # get any optional parameters
+    while [ $# -gt 4 ] ; do
+      case $1 in
+        -h) cat $0 | helper ; exit ;;
+        -d) debug=yes ; set -x     ;;
+        -z) zip=yes                ;; # zip up sco file
+        -u) update=yes             ;;
+        *)
+          break
+          ;;
+      esac
+      
+      shift
+    done
+
+  if [ $# -lt 4 ] ; then
+    echo "Missing arguments."
+    echo "Usage: $USAGE"
+    exit 1
+  fi
+
+  # get required parameters
+    vaultPath="$1"
+    course="$2"
+    version=$3
+    maxScore=$4
+    
+    set x `getCourseCodes "$course"`
+    shift
+    cc=$1
+    courseId=$2
+    
+# move to source directory
+  cd "$vaultPath"
+
+# clear target directory
+  toDir="TMPSCORM"
+  
+  if [ $update == no ] ; then
+    rm -rf "$toDir"
+    mkdir -p "$toDir/Images"
+  fi
+
+# copy sco boilerplate files
+  (
+    cd Scorm
+    cp -r * ../$toDir
+  )
+  
+# process source to target
+  # vault/dir/file.md
+  #           Resources/file.md
+  #       ---------------------
+  #       path
+  #       ---
+  #       tgtDir
+  # -----
+  # vault
+  # ---------
+  # srcDir
+  #           -------
+  #           bse
+  #           ----
+  #           ttl
+  #           
+  # vault/TMPSCORM/dir/file.html
+  # --------------
+  # toDir
+  #                -------------
+  #                toFile
+  #
+ 
+# first build the scorm file system with a folder for each learning path
+# and all elements of learning path inside the folder with resources
+# folder for supporting assets.
+ 
+if [ $update == yes ] ; then 
+  > tmpRes
+
+  echo "-------- translate all transclusions to m4 includes place in .tmp files"
+  du -a . |\
+      grep -Ev '(TMPSCORM|obsidian|trash|node_modules|package_lock|certificates|\._)' | \
+      grep  '.md$' | \
+      while read sz path ; do
+        srcDir=${path%/*}               # find final directory in path
+        shortPath="${srcDir:2}"         # remove leading ./
+        clearPath="${shortPath// /-}"   # change space to underscore
+        mkdir -p /tmp/$clearPath
+        mkdir -p "$toDir/${clearPath}"  # ensure directory exists
+        bse=`basename "$path"` 
+        spec="$clearPath${clearPath:+/}$bse"
+        tmpFile=/tmp/${spec}
+        cat "$spec" | perl -pe 's/!\[\[((?!.*(png|pdf)).*)\]\]/include(\/tmp\/'$shortPath'\/\1.md)/g' > "$tmpFile"
+      done
+
+  echo "-------- translate to html and copy to tmp "
+  du -a . |\
+      grep -Ev '(TMPSCORM|obsidian|trash|node_modules|package_lock|sco.zip|Scorm|Sync|\._)' | \
+      grep -E '(png|jpg|gif|pptx|csv|md|html|pdf|m4a|mp4)' | \
+      sort -k2 | (
+        read dummy
+        
+        while read sz path ; do
+          srcDir=${path%/*}               # find final directory in path
+          shortPath="${srcDir:2}"         # remove leading ./
+          clearPath="${shortPath// /-}"   # change space to dash
+          mkdir -p "$toDir/${clearPath}"  # ensure directory exists
+          tgtFile="${clearPath}"          # ? strip leading dot from du path
+          bse=`basename "$path"`          # get filename
+          spec=$clearPath${clearPath:+/}$bse
+          echo "  from: $path to: $spec"
+          thisCase="${path,,*}"
+      
+          case $thisCase in         
+            *png|*jpg|*gif)               # copy images as is
+              cp -u "$path" "$toDir/$clearPath"
+              cp -u "$path" "$toDir/Images/${bse// /-}"
+              echo "${srcDir}:${bse// /-}" >> tmpRes
+              ;;
+              
+            *m4a)
+              cp -u "$path" "$toDir/Audio/${bse// /-}"
+              echo "${srcDir}:${bse// /-}" >> tmpRes
+              ;;
+              
+            *mp4)
+              cp -u "$path" "$toDir/Video/${bse// /-}"
+              echo "${srcDir}:${bse// /-}" >> tmpRes
+              ;;
+              
+            *pptx|*csv|*pdf)                   # copy powerpoint and csv as is 
+              tgtDir=${path%/*}
+              mkdir -p "$tgtDir"
+              cp -u "$path" "$toDir/$clearPath"
+              echo "${srcDir}:${bse}" >> tmpRes
+              ;;
+
+            *md)                          # convert to html 
+              ttl=${bse:0: -3}            # remove extension
+              tmpFile="/tmp/${spec}"      # Identify include files
+              toFile=${spec%.md}.html     # make file html
+                                          # looking for links
+              cat "$tmpFile" | inc | pandoc --metadata title="$ttl" | \
+                  sed -f ~/bin/etl.sed > "$toDir/${toFile// /-}"
+              # rm "${tmpFile}"
+              echo "${srcDir}:${bse}" >> tmpRes
+              ;;
+              
+             *)
+               echo "Unsupported type: ${thisCase}"
+               ;;
+          esac
+        done
+      )
+
+  # make parent manifest
+    makeManifest "$courseId" $version tmpRes > "$toDir/imsmanifest.xml"
+fi
+
+# zip it up
+  if [ $zip == yes ] ; then
+    zipit $cc $maxScore
+  fi
+  
+

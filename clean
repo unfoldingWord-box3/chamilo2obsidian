@@ -1,0 +1,2 @@
+rm -rf /tmp/Chamilo
+rm -fr /cygdrive/c/SpidelRoot/tmpmd/Training/{SCORM,tmpRes}

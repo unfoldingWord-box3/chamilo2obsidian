@@ -1,0 +1,118 @@
+#!/bin/bash
+#######################################################################
+#
+# NAME  dcs2md - get repo from dcs and convert files to markdown
+#
+  USAGE="$0 -h -r <user> <repo> <target>
+  Where 
+    -h = This text
+    -r = Do not download repo 
+    user is a dcs user and
+    repo is a dcs repository
+    target is destination root directory of all files
+  Ex:
+    $0 joeldruark alignment_training /tmp/$2
+  "
+#  
+#######################################################################
+
+count=1
+getRepo=yes
+
+while [ $# -gt 0 ] ; do
+  case $1 in
+    -h|--help)
+      cat $0 | helper
+      exit
+      ;;
+
+    -r)
+      getRepo=no
+      ;;
+      
+    *)
+      case $count in
+        1) user=$1 ;;
+        2) repo=$1 ;;
+        3) target=$1 ;;
+        *) echo "Too Many args:"
+           echo "USAGE $USATE"
+           exit 2
+           ;;
+      esac
+      
+      (( count++ ))
+      ;;    
+  esac
+
+  shift
+done
+
+if [ $count -lt 4 ] ; then
+  echo "Missing argument"
+  echo "USAGE $USAGE"
+  exit 1
+fi
+
+# Default arguments for test
+  user=joeldruark
+
+  repo=ALN_SAMPLE_REPO
+  repo=1102434_ALN_20210917-132331
+  repo=Introduction-to-Aligning
+
+  target="kbfs:/team/unfoldingword.mdm/uW Content Library/Training Modules/$repo"
+  target=/tmp/$repo
+
+
+mkdir -p $target
+
+if [ $getRepo = yes ] ; then
+  git clone https://git.door43.org/$user/$repo.git
+#  file=README.md
+#       https://git.door43.org/joeldruark/alignment_training/raw/branch/master/README.md
+#  curl https://git.door43.org/$user/$repo/raw/branch/master/$file
+fi
+
+cd $repo
+du -a . | sort -k2 | grep -v '.git' > ../tmplist
+cat ../tmplist
+
+while read size file ; do
+  echo "--- $file"
+  test -d "$file" && mkdir -p "$target${file:1}" && continue
+  
+  case "$file" in 
+    *md) 
+      echo "------ keeper $file" 
+      cp "$file" "$target${file:1}"
+      ;;
+      
+    *tsv)
+      echo "------ tsv to md"
+      to=${file%%.tsv}.md
+      cat "$file" | cvt t2m > "$target${to:1}"
+      ;;
+
+    *html|*htm)
+      echo "------ html to md"
+      to=${file%%.htm*}.md
+      cat "$file" | pandoc -f html -t markdown > "$target${to:1}"
+      ;;
+      
+    */.git*|*.DS_Store*)
+      echo "--------- ignore $file"
+      ;;
+      
+    *) 
+      echo "------ preserving unknown file type $file"
+      cp "$file" "$target${file:1}"
+    ;;
+  esac
+done < ../tmplist
+
+if [ $getRepo = yes ] ; then
+  cd ..
+  rm tmplist
+  rm -rf $repo
+fi

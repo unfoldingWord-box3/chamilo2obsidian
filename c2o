@@ -1,0 +1,2593 @@
+#!/bin/bash
+########################################################################
+#
+# NAME  c2o - Chamilo to Obsidian vault via api
+#
+# DESCRIPTION Look through the majors for a course in Obsidian and 
+#             upload it to Chamilo via its course API. if course
+#             is not supplied then all courses in the major will be
+#             uploaded.  
+#    
+#
+  USAGE="c2o [-h|--help|-d|--debug] [-s] <op> [args] 
+
+    Where:
+      -d         = Turn on bash tracing
+      -h         = This help text
+      -s         = Silent (no timestamps)
+      op         = One of many operations in this script
+      args:      
+        major    = Folder in vault
+        course   = Specific course name quoted
+        username = Chamilo user name
+        category = Course category name
+        code     = Category code
+        code     = Category code
+        lp       = Learning path name quoted
+        desc     = Description of test
+      "
+#             Content is organized assertion
+#               <vault>/Majors/<major>/Courses/<course>/
+#
+# FILES
+#   <vlt>/Majors/<maj>/Courses/<course>                   - course repository
+#                                      /Scorm
+#                                            /*.xsd       - scorm boilerplate
+#                                            /index.html  -
+#                                            /xml.xsd     - scorm spec
+#                                            /assets      - standalone code for course
+#                                      /Descriptions/*.md - parts of course description
+#                                      /Documents         - course content
+#                                                /Learning_Paths
+#                                                               /<lp>
+#                                                                    /*.html, *.pdf, *.pptx
+#                                      /Learning_Path-spec.md  
+#                                      /Images/*{png,gif,jpg}
+#                                      /Info.md
+#                                      /Audio/*m4a
+#                                      /Video/*mp4  
+#   ~/.c2o.config      - Contains chamilo credentials See: c2o get-config
+#   ~/bin/helper       - Used to show this comment block See c2o -h
+#   /tmp/tmpCourses    - course list
+#   /tmp/tmpCourses-lp - learning path list
+#
+# TBD
+#   Handle import and export of test images
+#   Handle question pools
+#   Attache an existing test to a course.
+#   Handle document pools
+#   To dup course change lp in paths in html docs
+#
+# SCENERIO
+#   Given course
+#   Export course resources (docs and images)
+#   Export course learning paths
+#   Export course tests
+#   
+# Anatomy of a Course
+#   /courses                 cc title 
+#   /course/<cc>/resources  
+#
+# jq cheat
+#   get all documents from resources
+#                                           vvv attr has value          vvv list of attrs
+#   jq -rc ' .resources[] | .[] | select( .type == "document" ) | { type, source_id, title, path }'
+#
+#                        vvv subarray
+#   jq -c '.resources.course_description[] | .[] | { type, source_id, title, content }'
+#
+########################################################################
+
+
+# sed pipes for incremental transformation
+  function deBlank {
+    sed -e 's/^\\$//g'
+  }
+  
+  
+  function deEsc {         # Remove escape from single quotes (put in by pandoc)
+    sed -e "s/\\\'/'/g"
+  }
+
+
+  function deQuote {       # Remove fancy quotes
+    sed -e "s/[‘’]/'/g;s/[“”]/'/g;s/&rsquo;/'/g;s/&lsquo;/'/g"
+  }
+
+
+  function escDblQuote {   # pair of double-quotes to \ double-quote
+    sed -e 's/""/\\"/g'
+  }
+  
+  function escQuote {      #
+    sed -e 's/"/\\"/g'
+  }
+  
+    
+  function deSpace {       # remove space, dashs and colons
+    sed -e 's/[- @#$%^&*:><]//g'
+  }
+  
+  
+  function deTag {         # Remove html tags
+    sed -e 's/<[^>]*>//g;s/&nbsp;/ /g'
+  }
+
+
+  function deJson {        # Break json attribute into 2 parts
+     sed -e 's/^ *"//;s/": "/ /;s/": / /;s/",$//;s/"$//;s/,$//'
+  }
+  
+  
+  function deStyle {       # Remove embedded style originated in chamilo
+    sed -e 's/{style[^}]*}//g'
+  }
+  
+
+  function deSpan {        # Remove html span tags that have style attributes
+    sed -e 's/<span style[^>]*>//g;s/&nbsp;/ /g'
+  }
+
+
+  function cleanCourse {   # change space to dash after removeing [:,#$%^&*()]
+    sed -e 's/[:,#$%^&*()+=@!]//g;s/ /-/g'
+  }
+
+
+  function cleanCode {     # change space to dash after removeing [:,#$%^&*()]
+    sed -e 's/[ :,#$%^&*()+=@!-]//g;'
+  }
+
+
+  function cleanTable {    # gets rid of leading and trailing |s
+    sed -e 's/^| *//;s/ *|$//;s/ *| */|/g'
+  }
+  
+  
+  function deNL {          # remove newlines and tabs from descriptive text
+    sed -e 's/\\r/ /g;s/\\n/ /g;s/\\t/ /g'
+  }
+  
+
+function addLp {           # <ownerId> <cc> <lp> - Create a new Learning Path
+  ownerId=$1
+  cc=$2
+  lp="$3"
+  
+  payload="{
+      \"user_id\": $ownerId,
+      \"name\": \"$lp\"
+      }"
+      
+ #     \"description\": \"$desc\" $cat
+     
+  puttr course/$cc/learningpath "$payload"
+}
+
+
+function addDescriptions { # add all course descriptions
+  cc=$1
+  path="$2"
+
+  cd "$path/Descriptions"
+ 
+  ls *.md | {
+    while read file ; do 
+      content=`cat "$file" | deBlank | cvt m2h --wrap=none` 
+      type=0
+      
+      case $file in
+        *Description*) type=1 ;;
+        *Objectives*)  type=2 ;;
+        *Topics*)      type=3 ;;
+      esac
+      
+      if [ $type -eq 0 ] ; then
+        toolId="${file%.*}"
+        
+        payload="{
+           \"session_id\":  0,
+           \"intro_text\":  \"${content:0: -1}\"        
+        }"
+        
+        puttr course/$cc/tool/$toolId/intro_text "$payload"
+        
+      else               # type is embedded in file name
+        echo "--- uploading description title: $title  file: '$file'  type: $type"
+        title="${file//-/ }"
+      
+        payload="{ 
+            \"description_type\": $type,
+            \"title\":            \"$title\",
+            \"content\":          \"${content:0: -1}\"
+        }"
+      
+        puttr course/$cc/description "$payload"
+      fi
+    done
+  }
+}
+
+  
+function blank {           # string 0 is blank
+  if [ "x$1" = x0 ] ; then
+    echo ""
+  else
+    echo "$1"
+  fi
+}
+
+
+function createCourse {    # create course name before uploading its components
+  major="$1"
+  course="$2"
+
+  m="${major// /-}"
+  c=`echo "$course" | cleanCourse`
+  path="$vault/Majors/$m/Courses/$c"
+  echo "Creating course from: $path"
+  info="$path/Info.md"
+  
+  if [ ! -d "$path" ] ; then
+    echo "No path found in vault: '$path'. Perhaps a misspelling"
+    exit 12
+  fi
+  
+  owner=`getInfo user ~/.c2o.config`
+  tmpCode=`echo $course | cleanCode`
+  tmpCode="${tmpCode^^}"
+    
+  if [ ! -f "$info" ] ; then # ensure minimum config
+    tmpDept=Training
+    
+    echo "# Manifest for '$path'           
+code          $tmpCode
+courseLanguge English   
+categoryName
+categoryCode    
+" > "$info"
+  fi   
+        
+  echo "Creating: $major - $course ${dept:+for }$dept"
+           cc=`getInfo code           "$info"`
+         lang=`getInfo course_language "$info"`
+#         dept=`getInfo dept_name      "$info"`   
+#          url=`getInfo dept_url       "$info"` 
+         catN=`getInfo categoryName   "$info"`
+ categoryCode=`getInfo categoryCode   "$info"`     
+#        quota=`getInfo disk_quota     "$info"`
+#      visible=`getInfo visibility     "$info"`      
+#          sub=`getInfo subscribe      "$info"` 
+#        unsub=`getInfo unsubscribe    "$info"`        
+
+  owner_id=`getUserId "$owner"`
+
+  echo "Owner: $owner id: $owner_id"
+#  cat "$path/Descriptions/Intro_Text.md" | cvt m2h --wrap=none > "$tmpC-Desc"
+  #desc=`cat "$tmpC-Desc"`
+#  desc=$(<"$tmpC-Desc")
+#  echo "$desc" > /tmp/bms
+
+  payload="\"user_id\":         ${owner_id},
+      \"title\":              \"${course}\""
+      
+    test -n "$tmpCode"      && payload="$payload,
+      \"wanted_code\":        \"${tmpCode}\""
+     
+    test -n "$lang"    && payload="$payload,
+      \"course_language\":    \"${lang}\""
+      
+    test -n "$dept"    && payload="$payload,
+      \"department_name\":    \"${dept}\""
+   
+    test -n "$url"     && payload="$payload,
+      \"department_url\":     \"${url}\""
+     
+    test -n "$catN"    && payload="$payload,
+      \"course_category\":    \"${catN}\""
+  
+    test -n "$quota"   && payload="$payload,
+      \"disk_quota\":           ${quota}"
+  
+   test -n "$visible" && payload="$payload,
+      \"visibility\":           ${visible}"
+      
+#   test -n "$desc"    && payload="$payload,
+#      \"intro_text\":         \"${desc:0: -1}\""   
+    
+#    test -n "$sub"     && payload="$payload
+#      \"subscribe\":         ${sub},"
+#                        payload="$payload
+#      \"unsubscribe\":       ${unsub:-0}"
+      
+#  echo "Final Payload: 
+#      $payload
+#" 
+
+  puttr course "{ $payload }"  
+}
+
+
+function createDoc {       # create document name DEPRECATED
+  title=$1
+  pid=$2
+  prevId=$3
+  createId=$4
+  prereq=$5
+  content=$6
+  
+  echo "Creating: doc: $title"
+
+  payload="{
+      \"title\":        \"${title//\'}\",
+      \"content\":      \"${content//\'}\",
+      \"parent_id\":    \"$pid\",
+      \"previous_id\":  \"$prevId\",
+      \"creator_id\":   \"$createId\",
+      \"prerequisite\": \"$prereq\"
+  }"
+  
+  puttr course/$cc/document "$payload"
+}
+
+
+function coursedoc {       # documentation of course message
+  msg='
+  saved from get
+  |  updated from local
+  v  v
+    {
+ +     "iid": "56",
+       "c_id": "45",
+       "id": null,
+ +  +  "title": "Metaphor Final",
+ +  +  "description": "<p>Now that you have completed your training on metaphors, it&#39;s time to put what you have learned to work. Answer the following questions to demonstrate your proficiency at identifying and translating metaphors.&nbsp;</p>",
+ +     "sound": "",
+ +  +  "type": "2",
+ +  +  "random": "10",
+ +  +  "random_answers": "1",
+ +     "active": "1",
+ +  +  "results_disabled": "0",
+        time_expired
+        propagate_neg
+        saveCorrectAnswers
+       "access_condition": null,
+ +     "max_attempt": "2",    (attempts)
+       "start_time": null,
+       "end_time": null,
+ +  +  "feedback_type": "0",
+       "expired_time": "0",
+       "session_id": "0",
+       "propagate_neg": "0",
+       "save_correct_answers": "0",
+       "review_answers": "0",
+ +  +  "random_by_category": "0", (randomByCat)
+ +  +  "text_when_finished": "<p>Congratulations. You have completed your examination for metaphors. You are now ready to study more figures of speech.</p>",
+       "display_category_name": "1",
+ +  +  "pass_percentage": "90",
+        onSuccessMessage
+        onFailedMessage
+        emailNotifiationTemplate
+        emailNotifiationTemplateToUser
+        NotifyUserByEmail
+        ModelType
+ +  +  "question_selection_type": "2", (questionSelectionType)
+ +  +  "hide_question_title": "0"  (hideQuestionTitle)
+       "scoreTypeModel": 0,
+       "globalCategoryId": 0,
+       "showPreviousButton": 0,
+       "exerciseCategoryId": 0,
+       "hideQuestionNumber": 0,
+       "preventBackwards": 0,
+       "activate_start_date_check": 0,
+       "activate_end_date_check": 0,
+       "enabletimercontrol": 0
+    }'
+}
+
+
+function dellr {           # delete an entity
+  endpoint=$1
+
+  curl -s -X 'DELETE' "$host/$api/$endpoint" \
+    -H 'accept: */*' \
+    -H "Authorization: Bearer $token" 
+}
+
+
+function getInfo {         # <attr> <file> get config info for c2o
+  look=$1
+  path="$2"
+  
+  set x `grep -e  "^$look " "$path" | grep -v '#'`
+  shift ; shift
+  
+  if [ $# -eq 0 ] ; then
+    echo  "Config is missing: $look in: $path. Continuing." >&2
+  fi
+  
+  echo $*
+}
+
+
+function getToken {        # given user credentials, obtain security token
+  usr=`getInfo user ~/.c2o.config`
+  pwd=`getInfo pswd ~/.c2o.config`
+
+  payload="{
+    \"username\": \"$usr\",
+    \"password\": \"$pwd\"
+  }"
+  
+  puttr auth "$payload" | jq -r '.token'
+}
+
+
+function gettr {           # boilerplate for parameterless GET endpoints
+  endpoint=$1
+  c=
+  
+  if [ "$endpoint" != "courses"  ] ; then
+    c="-H 'Content-Type: application/json; charset=utf-8'"
+  fi
+  
+  curl -s -X 'GET' "$host/$api/$endpoint" -H 'accept: */*' -H "Authorization: Bearer $token" $c 
+}
+
+
+function getUserId {       # given user name get user id else get all users
+  if [ $# -gt 0 ] ; then
+    gettr "users?username=$1" | jq -r '.[].user_id'
+  else
+    gettr users | jq -c '.[] | {user_id, username, first_name, last_name}' | $mlrC  
+  fi
+}
+
+
+function getCourseId {     # get course id from course name
+  course="$*"
+  courses=`gettr courses | jq -cr '.[] | {id, title}' | $mlrP`
+  cId=`echo "$courses" | grep "$course" | cleanCourse | cut -d ' ' -f 1`
+
+  if [ "x$cId" = x ] ; then
+    logError "--" "getCourseId: No such course: $course"
+  fi
+
+  echo $cId
+}
+
+
+function getCourseCode {   # '<course>' - get course code from course name
+  course="$*"
+  
+  firstVal='s/^[^:]*:"//;s/".*$//'
+  cc=`gettr courses | jq -cr '.[] | { code, title }' | grep "\"$course\"" | sed -e $firstVal `
+
+  if [ "x$cc" = x ] ; then
+    logError "getCourseCode: No such course: $course"
+  fi
+
+  echo $cc
+}
+
+
+function getLpId {         # <cc> <lp> - get learning_path_id given course and lp
+  cc="$1"
+  lp="$2"
+  
+  #cc=`getCourseCode "$course"`
+  gettr course/$cc/learningpaths | jq -c '.[]' | $mlrP | grep "$lp" | cut -d' ' -f 1
+}
+
+
+function logError {        # display error and USAGE then exit script
+  op=$1
+  shift
+
+  case "$op" in
+    "n~a"|"u~a")  # missing op
+      echo $*
+      echo "USAGE: $USAGE"
+      ;;
+
+    *)
+      echo $op $*
+      
+      grep "$op" ~/bin/c2o | grep '##' | sed -e 's/##//;s/\*) *//'
+      ;;
+  esac
+  exit
+}
+
+
+function pattr {           # boilerplate for PATCH endpoints
+  endpoint=$1
+  shift                   # everything else is payload
+  
+  curl -s -X 'PATCH' "$host/$api/$endpoint" \
+    -H 'accept: */*' \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json; charset=utf-8' \
+    -d "$*"
+}
+
+
+function puttf {           # upload a file of some typeq
+  endpoint="$1"
+  file="$2"               # src
+  path="$3"               # tgt
+  title="$4"
+  comment="$5"
+  
+  ext=${file##*.}
+  pre=";type="
+  
+  case $ext in
+    png|jpg) app="${pre}image/$ext"      ;;
+    m4a)     app="${pre}audio/x-m4a"     ;;
+    mp4)     app="${pre}video/mp4"       ;;
+    pdf)     app="${pre}application/pdf" ;;
+    *)       app=""                      ;;
+  esac
+
+  if [ -n "$comment" ] ; then
+    opt="-F \"comment=$comment\""
+  fi
+  
+  curl --no-progress-meter -X 'POST' "$host/$api/$endpoint" \
+    -H 'accept: */*' \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: multipart/form-data; charset=utf-8" \
+    -F "file=@${file}${app}" \
+    -F "path=$path" \
+    -F "title=$title" \
+    $opt
+}
+
+
+function putti {           # upload an image DEPRECATED
+  endpoint="$1"
+  imageRef="$2"
+
+  curl -X 'POST' "$host/$api/$endpoint" \
+    -H 'accept: */*' \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: multipart/form-data; charset=utf-8" \
+    -F "imageUpload=@$imageRef" \
+    -F "title=$imageRef"
+}
+
+
+function puttr {           # boilerplate for POST endpoints
+  endpoint=$1 
+  shift                   # everything else is payload
+  
+  curl --no-progress-meter -X 'POST' "$host/$api/$endpoint" \
+    -H 'accept: */*' \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json; charset=utf-8' \
+    -d "$*"
+}
+
+
+function report {          # report op completion time
+  operation="$1"
+  sDate=$2
+  echo "Completed $operation in "$(( `date +%s` - $sDate ))" seconds." 
+}
+
+
+function shrink {          # <string> truncate and remove html tags
+  stripped=`echo "$*" | sed -e 's/<[^>]*>//g'`
+  echo "${stripped:0:20}"
+}
+
+
+function testKeys {        # <cc> make key file if not found built by add-doc TBD
+  if [ ! -f $tmpK ] ; then
+    cc=$1
+    gettr course/$cc/learningpaths | $mlrP | {
+      read headers
+      
+      while read lpId rest ; do
+        gettr course/$cc/learningpath/$lpId/documents | jq -c '.[] | { id, parent_id, display_order, title, path }' | $mlrP | {
+          read headers
+          
+          while read id pid dspo title path ; do
+            echo $id $pid $dspo $title
+          done }
+      done } > $tmpK
+  fi
+}
+
+
+function tooMany {         # log too many args
+  expected=$1
+  got=$2
+  shift 2
+  logError "${op}" "Too many arguments: expected $expected but got $got '$*'." 
+}
+
+
+function uploadTable {   # look through lp spec for items and assets assigning to lp tree
+  cc=$1
+  ownerId=$2
+  spec=$3
+  declare -A keys
+  
+  echo "   --- uploadTable: cc: '$cc', owner: '$ownerId',  spec: '$spec',  keyFile: '$tmpK'"
+  # read keys from tmpK    
+    while read id parent doc ; do
+      keys[ $doc ]="$id $parent"          
+    done < $tmpK
+ 
+   echo "debug Dump keys" 
+    for key in ${!keys[@]} ; do  
+      echo "keys[ $key ] = ${keys[$key]}"
+    done 
+
+  echo "   --- Traverse all its parts"
+  # 
+  # if this does match lp then
+  #   if - item then
+  #     skip
+  #   else has item
+  #     add section with no root
+  # else no match then
+  #   add section with previous as parent   
+  # if there is an asset then 
+  #    add asset to item
+  # recurse
+  # o lp item -
+  # o item section asset
+  # o section sub-section asset
+  
+  lps=`grep Learning_Path $spec`                                                                       # find the learning paths
+  prevId=0
+
+  echo "lps: 
+$lps"
+  
+  while read style type lp ; do                                                                        # for each learning path in spec
+    echo "      --- First make an LP: '$lp'" 
+    res=`addLp $ownerId $cc "$lp"`                                                                     # first create the learning path
+    set x `echo "$res" | jq -rc '.[] | { iid }' | jq -rc '.[]'`          
+    lpId=$2                                                                                            # new lp id
+   
+    lvl1s=`grep -e "^|[^|]*| *$lp.*" $spec | cleanTable | sort -t\|`                                   # Find items in lp in second column      
+    echo "lvl1s: 
+$lvl1s"
+    echo "      --- find what this lp: '$lp' contains and make them with items $item"
+
+    while IFS=$'|' read -r order1 container1 item1 asset1 junk ; do                                    # this is lp section 
+      echo "         --- make section '$item1'"
+      echo "         --- order1: '$order1'  Container1: '$container1'  Item1: '$item1'  Asset1: '$asset1'"
+      set x $item
+      shift
+ 
+      item="$*"
+      
+      if [ "$container1" == "$lp" ] ; then                # This row matches lp
+        if [ "x$item1" != "x-" ] ; then                   # if blank item it is unuseful artifact
+          pId2=`puttr course/$cc/learningpath/$lpId/section "{\"title\": \"${item1//-/ }\"}"`          # add section
+# TBD good to here -----------------------------------------------------------------   
+          
+          if [ "x$asset1" != "x-" ] ; then       
+            # add asset
+            baseAsset=`basename $asset1`
+            set x ${keys[$asset1]}
+            docId=$2
+            # second param should be id of asset    
+            payload="{
+              \"resource_id\":   $docId,    
+              \"resource_type\": \"document\",
+              \"title\":         \"${baseAsset%.*}\",
+              \"description\":   \"\",
+              \"prerequisite\":  0,
+              \"parent_id\":     $3,
+              \"previous_id\":   0
+            }"
+
+            pId3=`pattr course/$cc/learningpath/$pId2/item  "$payload"`                                # add optional asset
+          fi
+          
+#          echo "            --- Look at the lps item: '$item1'"
+#          lvl2s=`grep -e "^|[^|]*| *$item1.*" "$spec" | cleanTable | sort -t\|`
+
+#echo "lvl2s:
+# $lvl2s"          
+if [ "yes" = "no" ] ; then
+          while IFS=$'|' read -r order2 container2 item2 asset2 junk ; do
+            echo "               --- Looking at item '$item2'"
+            if [ "x$asset2" != "x-" ] ; then
+              set x $item2
+              shift
+              item1="$*"
+              
+              if [ -n "$item2" ] ; then                                                                # add asset
+                set x ${keys[$item2]}
+                
+                payload="{
+                  \"resource_id\":   $2,    
+                  \"resource_type\": \"document\",
+                  \"title\":         \"\",
+                  \"description\":   \"\",
+                  \"prerequisite\":  0,
+                  \"parent_id\":     0,           # 0 for root
+                  \"previous_id\":   0            # order sequence
+                }"
+# TBD integrate learning path objectives
+                pId3=`pattr course/$cc/learningpath/$pId/item  "$payload"` 
+                
+                if [ "x$asset2" != "x-" ] ; then
+                  set x ${keys[$asset2]} 
+                  echo "               --- now add '$item2' asset: '$asset2'"
+                  # TBD Resolve asset
+                    payload="{ 
+                      \"resource_id\":   $2,
+                      \"title\":       \"$item2\", 
+                      \"parent_id\":     $3, 
+                      \"previous_id\": \"$prevId\" }"
+                      
+                    puttr course/$cc/learningpath/$lpId/item $payload
+
+                  # TBD Resolve Audio
+                  if [ ${asset: -3} == "m4a" ] ; then
+                    echo "               --- add audio '$asset2' to item: '$item2'"                                      # add audio
+                    payload="{ }"
+    # TBD                puttr course/$cc/learningpath/$lpId/item/$lpIid/audio
+                  fi  
+                fi
+              fi
+            fi
+          done <<< "$lvl2s"
+fi          
+        fi
+      fi    
+    done <<< "$lvl1s"
+  done <<< "$lps"
+    
+#  rm $tmpK
+}
+
+
+function unwindTests {     # get all tests for a course
+  # Note empty strings replaced with 0
+  course="$1"
+  cc=`getCourseCode "$course"`
+# each TEST
+  echo "Tests for Course: $course"
+  testNum=1
+  # 's/null/"-"/g;s~\\r\\n~<br />~g;s/""/"0"/g'
+  gettr course/$cc/tests | jq -c '.[] | { iid, title, description, sound, type, random, random_answers, active, results_disabled, max_attempt, feedback_type, random_by_category, text_when_finished, pass_percentage,   question_selection_type, hide_question_title }' 2>&1 |\
+      grep -v assertion | sed -e 's/null/"-"/g;s~\\r\\n~<br />~g;s/""/"~"/g' | $mlrT | (
+        IFS=$'\t' read -r -a th  
+     
+        while IFS=$'\t' read -r -a tc ; do
+          sTst=`shrink ${tc[1]}`
+          printf  "\n## Test: (${testNum}) iid: '${tc[0]}'  ${tc[1]}\n\n" 
+          echo "| ${th[0]} | ${th[1]} | ${th[2]} | ${th[3]} | ${th[4]} | ${th[5]} | ${th[6]} | ${th[7]} | ${th[8]} | ${th[9]} | ${th[10]} | ${th[11]} | ${th[12]} | ${th[13]} | ${th[14]} | ${th[15]} | "
+          echo "|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|-----------|-----------|-----------|-----------|-----------|-----------| "
+          echo "| ${tc[0]} | ${tc[1]} (${testNum}) | ${tc[2]} | ${tc[3]} | ${tc[4]} | ${tc[5]} | ${tc[6]} | ${tc[7]} | ${tc[8]} | ${tc[9]} | ${tc[10]} | ${tc[11]} | ${tc[12]} | ${tc[13]} | ${tc[14]} | ${tc[15]} | " | sed 's/| - /|  /g;s/| ~ /|  /g;'
+
+        # each QUESTION  
+          questionNum=1
+          gettr course/$cc/test/${tc[0]}/questions | jq -c '.[]| { iid, question, description, typePicture, explanationLangVar,
+                                                                     weighting, position, type, level, picture, 
+                                                                     category, mandatory, isContent, feedback}' |\
+              sed -e 's/null/"-"/g;s/\\r\\n/<br \/>/g;s/""/"~"/g' | $mlrT | ( 
+            IFS=$'\t' read -r -a qh # read the question header once
+
+            while IFS=$'\t' read -r -a qc ; do
+              sQues=`shrink ${qc[1]}`
+              desc=`echo $qc[2] | deStyle | escDblQuote`
+              printf "\n### Question: (${testNum}.${questionNum}) iid: ${qc[0]}  '${sQues}...' for test: '${sTst}...' \n\n" 
+              echo "| ${qh[0]} | ${qh[1]} | ${desc} | ${qh[3]} | ${qh[4]} | ${qh[5]} | ${qh[6]} | ${qh[7]} | ${qh[8]} | ${qh[9]} | ${qh[10]} | ${qh[11]} | ${qh[12]} | ${qh[13]} | "
+              echo "|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------|-----------|-----------|-----------|-----------| "
+              echo "| ${qc[0]} | ${qc[1]} (${testNum}.${questionNum}) | ${qc[2]} | ${qc[3]} | ${qc[4]} | ${qc[5]} | ${qc[6]} | ${qc[7]} | ${qc[8]} | ${qc[9]} | ${qc[10]} | ${qc[11]} | ${qc[12]} | ${qc[13]} | " | sed 's/| - /|  /g;s/| ~ /|  /g;'
+
+            # each ANSWER
+              answerNum=1
+              ans=`gettr course/$cc/test/${tc[0]}/question/${qc[0]}/answers`          
+              count=`echo "$ans" | grep -c '"status": "error"' `
+              
+             if [ $count -eq 0 ] ; then
+               echo "$ans" | jq -c '.[] | { iid, answer, correct, comment, ponderation, position,
+                                           hotspot_coordinates, hotspot_type, destination, answer_code}' |\
+                  sed -e 's/null/"-"/g;s/\\r\\n/<br \/>/g;s/""/"~"/g' | grep -v assertion | $mlrT | (
+                IFS=$'\t' read -r -a ah # read the question header once
+
+                while IFS=$'\t' read -r -a ac ; do
+                  if [ "x$isHdr" = x ] ; then
+                    sAns=`shrink ${ac[1]}`
+                    sQues=`shrink ${qc[1]}`
+                    printf "\nAnswer: (${testNum}.${questionNum}.${answerNum}) '${sAns}...'  to question: '${sQues}...' \n\n"
+                    echo "| ${ah[0]} | ${ah[1]} | ${ah[2]} | ${ah[3]} | ${ah[4]} | ${ah[5]} | ${ah[6]} | ${ah[7]} | ${ah[8]} | ${ah[9]} | "
+                    echo "|----------|----------|----------|----------|----------|----------|----------|----------|----------|----------| "
+                    isHdr=no
+                  fi
+
+                  echo   "| ${ac[0]} | ${ac[1]} (${testNum}.${questionNum}.${answerNum}) | ${ac[2]} | ${ac[3]} | ${ac[4]} | ${ac[5]} | ${ac[6]} | ${ac[7]} | ${ac[8]} | ${ac[9]} | " | sed 's/| - /|  /g;s/| ~ /|  /g;'
+                  (( answerNum++ ))
+                done )
+             fi
+              
+               (( questionNum++ ))
+            done )     
+          (( testNum++ ))
+        done )
+}
+
+
+function upload {          # <type> <path> upload a category of files
+  type="$1"
+  path="$2"
+  cd "$path"
+  
+  case $1 in
+    Images)
+      exeOp add-images "$*"
+      ;;
+    
+    Docs)
+      cat "$path" | cvt m2ht 
+      exeOp add-docs
+      ;;
+      
+    LPs)
+      exeOp add-doc-lps
+      ;;
+      
+    *) echo unknown type $type
+      ;;
+  esac
+}
+
+
+function exeOp {           # <options> <op> <args> - handle a cli command
+                           # this is complicated. exeOp may be called with a set
+                          # of args. In this case argIdx will be non 0
+                          # if recursively called then process args as cli args
+  match=yes
+  firstArg=0
+  
+  if [ $argIdx -gt 0 ] ; then
+    argCount=$argIdx      # already have cli args
+  else
+    declare -A args
+    
+    while [ $# -gt 0 ] ; do
+      args[$argIdx]="$1"
+      (( argIdx++ ))
+      shift
+   done
+   
+   argCount=$argIdx
+  fi
+  
+  argIdx=0
+  
+  while [ "$match" == "yes" ] ; do
+    case "${args[$firstArg]}" in # Decode CLI for Help and Debug
+      -h|--help) # help function
+        case $argCount in
+          0|1)
+            cat $0 | helper 
+            grep ' ## ' ~/bin/c2o | grep -Ev 'TBD|grep' | while read c d r ; do echo $c $r ; done | tail -n +2 | sed -e 's/^/  /;s/\*) *//'
+            ;;
+            
+          *)
+            grep ' ## ' ~/bin/c2o  | grep "${args[$((++firstArg))]}" | while read c d r ; do echo $c $r ; done | sed -e 's/^/  /;s/\*) *//'
+            ;;
+        esac
+        
+        exit
+        ;;
+
+      -d|--debug) # --- debug from here on
+        bug=" -d "
+        set -x
+        ;;
+        
+      -s) # silent mode no timestamp
+        tim=" -s "
+        timer=no
+        ;;
+        
+      *) match=no
+        break
+        ;;
+    esac
+    
+    (( firstArg++ ))
+  done
+
+  argCount=$(( argCount - firstArg ))
+  
+  if [ $argCount -gt 0 ] ; then # save operation
+    op="${args[$firstArg]}"
+    (( firstArg++ ))
+    (( argCount-- ))
+  else
+    logError "n~a" "Missing argument: Operation"
+  fi 
+  
+  case $op in             # --- decode cli operations ---
+# Courses  
+    add-course-comp*)     ## [lete] '<major>' '<course>' - add complete course info to chamilo  TBD
+      case $argCount in
+        0|1) logError $op "Missing: major or course" ;;
+        2)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          
+          m="${major// /-}"
+          c=`echo "$course" | cleanCourse`
+          path="$vault/Majors/$m/Courses/$c"
+          
+          echo "--- first create course metadata"
+            res=`createCourse "$major" "$course"`
+          
+          echo "--- add Categories"
+            exeOp add-cat "$major" "$course" "all" | jq '.message' 
+            exeOp add-lp-cat "$major" "$course"
+            
+          echo "--- add various course descriptions"
+            tmpCode=`echo $course | deSpace`
+            tmpCode="${tmpCode^^}"
+            addDescriptions "${tmpCode}" "$path"
+            
+          echo "--- add glossary items"
+            exeOp $bug add-glos  "$major" "$course" Glossary_Items.md
+           
+          echo "--- add documents"
+            exeOp add-docs "$major" "$course"   
+
+          echo "--- add learning paths "         
+            exeOp $bug add-lp    "$major" "$course" Learning_Path-spec.md
+           #exeOp $bug add-scorm "$major" "$course" "1.0" 1
+  
+          echo "--- add tests"
+            exeOp $bug add-tests "$major" "$course" Tests.md 
+          ;;
+
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+      
+    add-course-desc*)     ## [riptions] '<major>' '<course>' - Add all the course descriptions
+      case $argCount in
+        0|1)  logError $op "Missing: major or course" ;;
+        2) # Upload all courses descriptions
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+
+          m="${major// /-}"
+          c=`echo "$course" | cleanCourse`
+          #c="${course// /-}"
+          cc=`getCourseCode "$course"`
+          path="$vault/Majors/$m/Courses/$c"
+          addDescriptions $cc "$path"
+        ;;
+        
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+      
+    add-cou*)             ## [rse] [ [ '<major>' ] '<course>' ] - add course to chamilo with metadata
+      case $argCount in
+        0) # Upload all courses in all majors
+          cd "$vault/Majors"
+          
+          ls | while read major ; do
+            echo "Adding all courses in major: $major"
+            exeOp add-cou "$major"
+          done
+          ;;
+          
+        1) # Upload all courses of a major
+          major="{$args[$firstArg]}"      
+          cd "$vault/Majors/$major"
+
+          ls | while read courses ; do 
+            echo "  Adding Course: $course"
+            exeOp add-cou "$major" "$course"
+          done        
+          ;;
+          
+        2) # Upload all components of a course
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"    
+          
+          createCourse "$major" "$course"           
+          ;;
+
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+    
+    add-glos*)            ## [sary]  '<major>' '<course' '<file>' - add glossary items to course
+      case $argCount in
+        0) logError $op "Missing Major" ;;
+        1) logError $op "Missing Course name" ;;
+        2) logError $op "Missing source file name" ;;
+        3)
+           major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+            file="${args[$((++firstArg))]}"
+
+          m="${major// /-}"
+          c=`echo "$course" | cleanCourse`
+          cc=`getCourseCode "$course"`
+          path="$vault/Majors/$m/Courses/$c"
+          
+          cat "$path/$file" | cleanTable | {
+            read hdr
+            read sep
+            
+            while IFS=$'|' read nme desc ; do
+              d=`echo $desc | escQuote`
+              payload="
+              {
+                \"name\": \"$nme\",
+                \"description\": \"$d\" 
+              }"
+               
+              puttr course/$cc/tool/glossary "$payload" | jq '.'
+            done
+          } 
+          ;;
+          
+        *) tooMany 2 $argCount ;;     
+      esac          
+      ;;
+      
+    del-cou*)             ## [rse] '<course>' - delete a course and all its assets
+      case $argCount in
+        0) logError $op "Missing Course name" ;;
+        1)
+          course="${args[$firstArg]}"
+          cc=`getCourseCode $course`
+          
+          dellr course/$cc 
+          ;;
+      esac
+      ;;
+      
+    get-course-c*)        ## [omplete] '<major>' '<course>' - get complete course, documents and resources
+      case $argCount in
+      # this case uses other cases to extract everything about a course
+      # from chamilo into an obsidian vault.
+        0|1) logError $op "Missing: major or course" ;;
+        2)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+
+          echo "--- getting course code"
+            cc=`getCourseCode "$course"`
+            c=`echo "$course" | cleanCourse`
+            pth="Majors/$major/Courses/$c"
+            path="$vault/$pth"
+            mkdir -p "$path"
+            cd "$path"
+            echo "Transporting Chamilo course to '"`pwd`"'"
+
+          echo "--- getting course info" 
+            exeOp -s get-course-info "$course"        > Info.md
+          
+          echo "--- getting course categories"
+            echo "   --- get all courses categories"
+            exeOp $bug get-cat                        > Categories.md
+            
+            echo "   --- get this courses categories"  
+            exeOp $bug get-lp-cat "$course" | cvt t2m > Learning_Path_Categories.md
+            
+          echo "--- getting course documents"
+            exeOp $bug get-doc "$major" "$course" # 91k
+
+          echo "--- getting backup and unpacking it"
+            exeOp $bug get-back "$major" "$course" # 68m
+            
+          echo "--- getting sco file and unpack it"
+            exeOp $bug get-sco "$major" "$course" # 69m
+          
+          echo "--- getting course descriptions Glossary, Quiz and Forum home page descriptions"
+            exeOp $bug get-res-desc "$major" "$course" 
+          
+          echo "--- getting learning path table"
+            exeOp $bug get-lp-sec "$course"           > Learning_Path_Spec.md
+            
+          echo "--- getting course tests"
+            exeOp $bug get-test "$major" "$course"    > Tests.md
+          ;;
+        esac
+      ;;
+      
+    get-course-d*)        ## [ocument] [ '<course>' ] - show course content
+      case $argCount in
+        0) ## - list course names and document attributes
+          gettr courses | jq -c '.[] | { title }' | $mlrP | (
+            read dummy
+            
+            while read title ; do
+              echo "--- Course: $cc $title ---"
+              exeOp -s get-course-doc "$title"
+            done
+          )
+          ;;
+          
+        1) ## <course> - get cc for course and its docs
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"`
+          exeOp -s get-course-doc $cc "$title"
+          ;;
+          
+        2) ## <cc> <ttl> - get course docs from cc. Called from 1
+          cc="${args[$firstArg]}"
+          gettr course/$cc/documents | jq -c '.[] | { id, filetype, path }' | $mlrP
+          ;;
+          
+        *) tooMany 0-2 `(( $argCount - $firstArg ))` "${args[@]}" ;;
+      esac
+      ;;
+      
+    get-course-i*)        ## [nformation] '<course>' - retrieve all course metadata
+      case $argCount in
+        0) logError $op "Missing: course" ;;
+        1)
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"`
+          #echo title $course
+          #echo cc $cc
+          
+          # categoryCode, categoryName, course_language, course_image, course_image_large 
+          gettr course/$cc | jq '.' | (
+            while read attr val ; do
+              attr="${attr//\"}"  # remove quotes
+              attr="${attr//:}"   # remove colon
+              val="${val/,}"      # remove commas
+              val="${val//\"}"    # remove quotes
+
+              case $attr in
+                real_id|code|categoryCode|categoryName|course_language|show_score|course_image_large|course_image)
+                  echo $attr $val ;;
+              esac
+            done )
+          ;;
+          
+          3) tooMany 1 $argCount ;;
+        esac        
+      ;;
+      
+    get-cou*)             ## [rse] [ [ '<major>' ] '<course>' ] - get course names with ids, or course info, or course documents
+      case $argCount in
+        0) # get all course names and some attributes
+          gettr courses | jq -r '.[] | { id, code, title, category_code }' | $mlrP
+          ;;
+
+        1) # get all of a courses attributes
+          course="${args[$firstArg]}"
+          gettr courses | jq -c '.[]' | grep "$course" | jq -r '.'
+          ;;
+
+        2) # get all course content
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          c=`echo "$course" | cleanCourse`
+          pth="Majors/$major/Courses/$c/Documents/Learning_Paths"
+          tgtPath="${pth// /-}"
+          tgtPath="$vault/$tgtPath"
+          mkdir -p "$tgtPath"
+          cd "$tgtPath"
+          cc=`getCourseCode "$course"`
+          echo "Course Code: $cc  Title: $course  BasePath: '$tgtPath'" 
+          
+          gettr course/$cc/learningpaths | jq -cr '.[] | { id, name }'  2>&1 |\
+              $mlrP 2>&1  | grep -v "Unable to parse" | (
+            read dummy
+            
+            while read lpId name ; do
+              echo "Learning_Path_id: $lpId  Name: $name"
+              gettr course/$cc/learningpath/$lpId/documents | jq -r '.[] | select(.type == "document") | { path, content }' | (
+                while read -r line ; do
+                  case "$line" in
+                    *'"path":'*)     
+                      echo " raw line:  $line"
+                      spec=`echo "$line" | sed -e 's/^.*learning_path\///;s/",$//'`
+                      echo "Spec: $spec"
+                      srcPath="${spec%/*}"
+                      echo "srcPath: $srcPath"
+                      file=`basename "$spec"`
+                      echo "Basename: $file"
+                      target="$srcPath/$file"
+                      ;;
+
+                    *'"content":'*)
+                      mkdir -p "$srcPath"
+                      echo "at: `pwd` from: $spec  to: $target"
+                      echo "${line:12}"  | sed -e 's/\\r\\n//g;s/\\t//g;s/"$//' | pandoc -f html -t markdown >  "$target"
+                      ;;
+                  esac        
+                done )
+            done )
+          ;;
+          
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+      
+#    get-des*)             ## [cription] '<major>' '<course> - get course description components of 8 possible
+#      case $argCount in
+#      # should be replaced with get-res-desc
+#        0|1) logError $op "Missing: arguments." ;;
+#        2)
+#          major="${args[$firstArg]}"
+#          course="${args[$((++firstArg))]}"
+#          c=`echo "$course" | cleanCourse`
+#          cc=`getCourseCode $course`
+#          pth="Majors/$major/Courses/$c/Descriptions"
+#          #path="${pth// /-}"
+#          path="$vault/$pth"
+#          
+#          gettr "course/$cc/resources" | jq -r '.resources.course_description? | .[]? | { source_id, title, content }' | deJson {
+#            while read -r op val ; do        
+#              case $op in
+#                id)
+#                  ;;
+#                  
+#                title)
+#                  ttl=`echo ${val} | sed -e 's/",$//;s/^"//'`
+#                  fle="${ttl// /-}"
+#                  ;;
+#                  
+#                content)
+#                  con=`echo ${val} | sed -e 's/"$//;s/^"//'`
+#                  echo "   --- getting $fle"
+#                  mkdir -p "$path"
+#                  echo "$con" | sed -e 's/^.*": "//;s/\",$//' | deQuote | deSpan | deNL  | \
+#                     cvt h2m | deEsc > "$path/${fle}.md"
+#                  ;;
+#                  
+#              esac
+#            done }
+#
+#          # get course intro_text
+#            echo "   --- getting intro_text"
+#            gettr course/$cc/resources | grep intro_text | \
+#                sed -e 's/^.*": "//;s/\",$//' | deQuote | deSpan | deNL  | \
+#                cvt h2m | deEsc > "$path/Intro_Text.md"
+#
+#            ;;
+#            
+#        *) tooMany 2 $argCount ;;    
+#      esac      
+#      ;;
+      
+# Categories
+    add-cat*)             ## [egories] '<major>' '<course> [ all | '<catCode>' '<cat>' ]  - add a new category with name and code 
+      # TBD nested categories. Need new column for parent in file
+      
+      if [ $argCount -gt 1 ] ; then
+        major="${args[$firstArg]}"
+        course="${args[$((++firstArg))]}"
+        m="${major// /-}"
+        c=`echo "$course" | cleanCourse`   
+        path="$vault/Majors/$m/Courses/$c"
+      fi
+      
+      case $argCount in
+        0) logError $op "Missing: major" ;;
+        1) logError $op "Missing: course" ;;
+        2)
+          info="$path/Info.md"
+          code=`getInfo categoryCode "$info"`
+          nme=`getInfo categoryName "$info"`
+          payload="{ \"category_code\": \"$code\", \"name\": \"${nme//\'}\" }"
+          puttr courses/category "$payload"
+          ;;
+          
+        3) # upload all categories
+          cat "$path/Categories.md" | cleanTable | {
+            read hdr
+            read sep
+            
+            while IFS=$'|' read -r  code cat rest ; do
+              #echo "--- Adding Category: $cat"
+              exeOp add-cat "$major" "$course" $code "$cat" 
+            done 
+          }          
+          ;;
+          
+        4)  
+          code="${args[$((++firstArg))]}"
+           nme="${args[$((++firstArg))]}"
+          payload="{ \"category_code\": \"$code\", \"name\": \"${nme//\'}\" }"
+          puttr courses/category "$payload"
+          ;;
+          
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+    
+    del-cat*)             ## [egory] <cc> - delete a category TBD
+      ;;
+      
+    get-cat*)             ## [egory] - get a list of categories with code names 
+      case $argCount in
+        0) gettr courses/categories | jq -c '.[] | { code, name }' | $mlrT | cvt t2m ;;
+        *) tooMany 0 $argCount ;;
+      esac
+      ;;
+      
+
+# Documents
+    add-docs)             ## <major> <course> - add docs like etl without manifest
+      case $argCount in
+        0)  logError $op "Missing: Major and Course" ;;
+        1)  logError $op "Missing: Course" ;;
+        2)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"  
+          
+          m="${major// /-}"
+          c=`echo "$course" | cleanCourse`
+          cc=`getCourseCode "$course"`
+          total=0
+          srcDir="$vault/Majors/$m/Courses/$c"
+          cd "$srcDir"
+          echo "   --- uploading from `pwd`"
+          rm -rf "$tmpH"
+          mkdir -p "$tmpH" 
+         
+if [ 1 -eq 0 ] ; then          
+          echo "-------- translate all transclusions to m4 includes place in .tmp files"
+
+          du -ha . |\
+              grep -Ev '(TMPSCORM|obsidian|trash|node_modules|package_lock|certificates|\._)' | \
+              grep '.md$' | {
+              while read sz path ; do
+                srcDir=${path%/*}               # find final directory in path
+                shortPath="${srcDir:2}"         # remove leading ./
+                clearPath="${shortPath// /-}"   # change space to underscore
+                mkdir -p /tmp/$clearPath
+                mkdir -p "$toDir/${clearPath}"  # ensure directory exists
+                bse=`basename "$path"` 
+                spec="$clearPath${clearPath:+/}$bse"
+                tmpFile=/$tmpH/${spec}
+                cat "$spec" | perl -pe 's/!\[\[((?!.*(png|pdf)).*)\]\]/include(\/tmp\/'$shortPath'\/\1.md)/g' > "$tmpFile"
+              done }
+fi
+
+          echo "      --- translate to html and upload to Chamilo"
+          declare -A docs # counts of docs by type
+          declare -A ids
+          
+          du -ha . | \
+              grep -Evi '(tmpscorm|categories|obsidian|trash|node_modules)' | \
+              grep -Evi 'package_lock|sco.zip|Scorm|Sync|\._)' | \
+              grep -Ei  '(png|jpg|gif|pptx|csv|md|html|pdf|m4a|mp4)$' | \
+              sort -k2 | {
+                read dummy
+                
+                while read sz path ; do
+                  bse=`basename "$path"`                                # get filename
+                  title="${bse//-/ }"                                   # replace dashes
+                  ext="${bse##*.}"                                      # get extension
+                  lcExt="${ext,,*}"                                     # lower case
+                  echo "         --- Uploading: $path size: $sz ext: $lcExt '$title'"
+                  endPoint=course/$cc/document
+                  
+                  (( docs[$ext]++ ))
+                  (( total++ ))
+                  re='x'
+                  
+                  case $lcExt in         
+                    png|jpg|gif) res=`puttf $endPoint "$path" /Images "$title" | jq '. | {iid,parent_id}' | $mlrP | tail -n+2` ;;   
+                    m4a)         res=`puttf $endPoint "$path" /Audio  "$title" | jq '. | {iid,parent_id}' | $mlrP | tail -n+2` ;;
+                    mp4)         res=`puttf $endPoint "$path" /Video  "$title" | jq '. | {iid,parent_id}' | $mlrP | tail -n+2` ;;  
+                    pptx)        res=`puttf $endPoint "$path" /Slides "$title" | jq '. | {iid,parent_id}' | $mlrP | tail -n+2` ;;  
+                    csv)         res=`puttf $endPoint "$path" /Tables "$title" | jq '. | {iid,parent_id}' | $mlrP | tail -n+2` ;;  
+                    pdf)         res=`puttf $endPoint "$path" /PDFs   "$title" | jq '. | {iid,parent_id}' | $mlrP | tail -n+2` ;; 
+
+                    md)                          # convert to html 
+                      case "$path" in
+                        *Descriptions*)       re='' ;;
+                        *non_exportable*)     re='' ;;
+                        *Learning_Path-spec*) re='' ;;
+                        *Default-certificate*)re='' ;;
+                        *Info.md|*Tests.md)   re='' ;;
+                        *)
+                          lessExt="${bse%.*}"                           # remove extension
+                          lp="${path//.\/Documents\/Learning_Paths\/}"  # strip context
+                          lp="${lp%/*}"                                 # isolate lp
+                          newFile="${lessExt}.html"
+                          localTmp="$tmpH/$newFile"
+                          
+                          cat "$path" | inc | pandoc --metadata title="$lessExt" | \
+                              sed -f ~/bin/etl.sed >  "$localTmp" 
+                          echo "            --- Adding document: $title"                              
+                          res=`puttf $endPoint "$localTmp" "/$lp" "${title%.*}.html" | jq '. | { iid, parent_id }' | $mlrP | tail -n+2`
+                          ;;
+                      esac
+                      ;;
+                      
+                    *)
+                      re='' 
+                      echo "Unsupported type: $ext"
+                      ;;
+                  esac
+                  
+                  if [ "x$re" == "xx" ] ; then                
+                    ids[$bse]="$res" 
+                  fi
+                done             
+              
+                echo "Doc counts"
+            
+                for key in ${!docs[@]} ; do  
+                  echo "  docs['$key'] = ${docs[$key]}"
+                done
+                echo "  Total: $total"
+                
+                echo "Doc ids"
+                rm $tmpK
+             
+              # only place to save doc keys
+                for key in ${!ids[@]} ; do                   
+                  echo "  ids['$key'] = ${ids[$key]}"
+                  echo "${ids[$key]} $key" >> $tmpK
+                done
+              }
+              
+          ;;
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+      
+    add-docx)             ## [ument] '<course>' '<lp>' '<title>' <pid> <prevId> <createId> <prereq> '<content>' - add a document to a course  DEPRECATED
+      case $argCount in
+        8) 
+          course="${args[$firstArg]}"
+              lp="${args[$((++firstArg))]}"
+           title="${args[$((++firstArg))]}"
+             pid="${args[$((++firstArg))]}"
+          prevId="${args[$((++firstArg))]}"
+        createId="${args[$((++firstArg))]}"
+          prereq="${args[$((++firstArg))]}"
+         content="${args[$((++firstArg))]}"
+
+          createDoc "$course" $lp "$title" $pid $prevId $createId $prereq "$content" 
+          ;;
+        
+        [0|1|2|3|4|5|6|7) 
+          logError $op "Missing one or more of: 
+          '<course>' '<lp>' '<title>' '<pid>' '<prevId>' '<createId>' '<prereq>' '<content>'"
+          ;;
+        *) 
+          tooMany 8 $argCount
+          ;;
+          
+      esac
+      ;;
+
+    add-doc*)             ## [ument] '<file>'  '<path>' '<title>' ['<comment>']
+      case $argCount in
+        0|1|2)  logError $op "Missing: file, path, and title" ;;
+        3|4)
+           file="${args[$firstArg]}"
+           path="${args[$((++firstArg))]}"
+          title="${args[$((++firstArg))]}"
+              
+          if [ $argCount -gt 3 ] ; then
+            comment="${args[$((++firstArg))]}"
+          else
+            comment=""
+          fi
+                    
+          puttf course/$cc/document "$file" "$path" "$title" "$comment"
+          ;;
+          
+        *) tooMany 4 $argCount   
+      esac        
+      ;;
+      
+    del-doc*)             ## [ument] '<course>' '<doc>' - delete a document  TBD
+      ;;
+      
+    get-doc-l*)           ## [ist] [ '<course>' [ '<lp>' ] ] - get list of docs in 1 or all courses in one or more lps
+      case $argCount in
+        0)  
+          gettr courses | jq -r '.[] | { title }' | $mlrP | ( 
+            read dummy
+            
+            while read course ; do
+              exeOp get-doc-list $tim $bug "$course"
+            done )
+          ;;
+          
+        1)  
+          course="${args[$firstArg]}"
+          echo "Course: $course"
+          cc=`getCourseCode "$course"`
+          
+          gettr course/$cc/learningpaths | jq -rc '.[]' | $mlrP | ( 
+            read dummy
+            
+            while read lpId lp ; do
+              echo "   LP: $lp"          
+              gettr course/$cc/learningpath/$lpId/documents | \
+                  jq -c '.[] | { id, type, parent_id, display_order, title }' | $mlrP 
+            done )
+          ;;
+          
+        2)
+          course="${args[$firstArg]}"
+              lp="${args[$((++firstArg))]}"
+          
+          cc=`getCourseCode "$course"`
+          lpRow=`gettr course/$cc/learningpaths  | jq -c '.[]' | $mlrP | grep "$2"`
+          set x $lpRow
+          gettr course/$cc/learningpath/$2/documents | jq -c '.[] | { id, title, path } ' | $mlrP
+          ;;
+          
+        *) tooMany "0-2" $argCount ;;
+      esac
+      ;;
+      
+    get-doc*)             ## [ument] [ '<major>' [ '<course>' [ '<lp>'] ] ] - get documents from courses learning paths
+      case $argCount in
+        0|1) 
+          echo "Local Majors"
+          ls "$vault/Majors" 
+          echo
+          
+          echo "   Chamilo Courses"
+          gettr courses | jq -cr '.[] | { title }' | $mlrC | tail -n +2 | sed -e 's/,/ /g' | (
+            while read title ; do
+              echo "      $title"
+            done )
+          ;;
+                  
+                  
+        2)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          cc=`getCourseCode "$course"`
+
+          gettr course/$cc/learningpaths | jq -rc '.[]' | $mlrP | (     
+            read dummy       
+            
+            while read lpId lp ; do 
+              echo "   --- lpId: $lpId,  lp: $lp"
+              exeOp get-doc "$major" "$course" "$lp" 
+            done )
+          ;;
+                  
+        3)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          lp="${args[$((++firstArg))]}"
+          
+          if [ -z $cc ] ; then
+            cc=`getCourseCode "$course"`
+          fi
+          
+          lpId=`exeOp get-lp "$course" | grep "$lp" | cut -d ' ' -f 1`
+          safeCourse=`echo "$course" | cleanCourse` 
+          
+          gettr course/$cc/learningpath/$lpId/documents | jq -r '.' | (
+            while read -r typ ln ; do
+              line=`echo "$ln" | sed -e 's/\",//g;s/\"//g' `
+              
+              case $typ in
+                *id*)
+                  id=$line
+                  ;;
+                  
+                *type*)          
+                  type=$line 
+#                  realP="$vault/Majors/$major/Courses/$safeCourse/Documents/${path##*document/}" # strip up through document
+#                  realP="${realP/learning_path/Learning_Paths}"
+                  realP="$vault/Majors/$major/Courses/$safeCourse/Documents/Learning_Paths/$lp/$title"
+                  # echo "      --- type: $type,  parentid: $pId,  order: $order,  path: '$realP', title: $title " 
+                  dir="${realP%/*}" # strip off basename
+                  
+                  case $type in
+                    dir)  # pptx pdf zip png jpg mp4 m4a html
+                      ;;
+                      
+                    document) 
+                      case "$path" in
+                        *html)
+                          mkdir -p "$dir"
+                          pat='s/\\r\\n\\t//g;s/\\r\\n//g;'
+                          echo -E "$content" | sed -e "$pat" | cvt h2m > "${realP/.html/.md}"
+                          ;;
+                       esac
+                      ;;
+                  esac
+                  ;;
+                  
+                *title*)         title="$line"     ;;
+                *content*)       content="$line"   ;;
+                *display_order*) order="$line"     ;;
+                *parent_id*)     pId="$line"       ;;
+                *path*)          path="$line"      ;;                
+              esac
+            done 
+            )
+          ;;
+          
+        *) tooMany "0-3" $argCount ;;
+      esac
+      ;;
+      
+
+# Learning Paths
+    add-lp)               ## '<major>' '<course>' '<spec>' - add a learning path with course name and lp name
+      case $argCount in
+        0|1|2) logError $op "Missing: major course or spec" ;;
+        3)        
+          # for each lp folder
+           major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+            spec="${args[$((++firstArg))]}"
+            
+          m="${major// /-}"
+          #c="${course// /-}"
+          c=`echo "$course" | cleanCourse`
+          cc=`getCourseCode "$course"`
+#          rm $tmpK
+          testKeys $cc
+          owner=`getInfo user ~/.c2o.config`
+          ownerId=`getUserId $owner`
+          path="$vault/Majors/$m/Courses/$c"
+          cd "$path"
+          uploadTable $cc $ownerId $spec
+#          rm $tmpK
+          ;;
+          
+        *) tooMany 3 $argCount ;;
+      esac
+      ;;    
+    
+    add-lpx)              ## '<major>' '<course>' [ '<lp>' [ '<category>' '<desc>' ] ] - add a learning path with course name and lp name
+      case $argCount in
+        0) logError $op "Missing: major" ;;
+        1) logError $op "Missing: course" ;;
+        2) 
+          # for each lp folder
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          c=`echo "$course" | cleanCourse`
+          path="$vault/Majors/${major// /-}/Courses/$c/Documents/Learning_Paths"
+          cd "$path"
+
+          ls | (
+            while read lp ; do
+              case $lp in
+                certificates|course_info.dat) ;;  # not learning paths
+                
+                *) 
+                  lpName="${lp//-/ }"
+                  echo "--- Adding lp: $lpName" 
+                  exeOp $bug add-lp "$major" "$course" "$lpName" 
+                  
+                  ls "$lp" | {
+                    while read lpSec ; do
+                      echo "   --- Adding lp section: $lpSec"
+                      exeOp $bug add-lp-sec "$major" "$course" "$lp" "${lpSec//-/ }"
+                    done
+                  }
+                  ;;
+              esac
+            done 
+          )
+          ;;
+          
+        3) 
+          major=$1
+          course="${args[$((++firstArg))]}"
+          lp="${args[$((++firstArg))]}"
+          shift 3
+          
+          desc=
+          cat=
+          
+          if [ $argCount -gt 1 ] ; then 
+            desc=", \"description\": \"$2\","
+            catId=`gettr courses/categories | jq -c '.[] | {id, name}' | $mlrC | grep "$1" | cut -d ' ' -f 1` 
+            cat="\"category_id\": \"$catId\""
+          fi
+          
+          cc=`getCourseCode $course`
+          owner=`getInfo user ~/.c2o.config`
+          ownerId=`getUserId $owner`
+          
+          curl -s -X 'POST' \
+          "$host/$api/course/$cc/learningpath" \
+          -H 'accept: */*' \
+          -H "Authorization: Bearer $token" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"user_id\": $ownerId,
+            \"name\": \"$lp\"
+            $desc $cat
+            }" # > /dev/null
+            
+  #        lpPath="${lp// /-}"
+  #        
+  #        ls $lpPath | {
+  #          while read fileDoc ; do
+  #            case "$fileDon" in
+  #              .md)
+  #                doc="${fileDoc//-/ }"
+  #              ;;
+  #          done
+  #        }        
+          ;;
+          
+        *) tooMany 3 $argCount ;;
+      esac
+      ;;
+      
+    add-lp-cat*)          ## [egory] '<major>' '<course>' [ '<category>' ] - add learning path category  TBD
+      case $argCount in
+        0)  logError $op "Missing: major, course and category" ;;
+        1)  logError $op "Missing: course" ;;
+        2)
+           major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          cc=`getCourseCode "$course"`
+          
+          cat "$path/Learning_Path_Categories.md"
+          payload="
+          { 
+            \"name\": \"$category\" 
+          }"
+          
+          puttr course/$cc/learningpaths/category "$payload"
+          ;;
+          
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+
+    add-lp-sec*)          ## [tion] '<major>' '<course>' '<lp>' '<section>' - add learning path section  TBD
+      case $argCount in
+        0|1|2|3) logError $op "Missing one of: major, course, lp, or section" ;;
+        4)
+            major="${args[$firstArg]}"
+           course="${args[$((++firstArg))]}"
+               lp="${args[$((++firstArg))]}"
+          section="${args[$((++firstArg))]}"
+          
+          cc=`getCourseCode "$course"`
+          lpId=`getLpId "$cc" "$lp"`
+          #content=
+          pId=0
+          prev=0
+          
+          payload="
+          {
+            \"title\":     \"${section//-/ }\",
+            \"parent_id\": \"$pId\",
+            \"previous\":  \"$prev\" 
+          }"
+          
+          puttr course/$cc/learningpath/$lpId/section  "$payload"
+          ;;
+          
+        *) tooMany 4 $argCount ;;
+      esac
+      ;;
+      
+    del-lp)               ## '<course>' '<lp>' - delete a learning plan  TBD
+      case $argCount in
+        0|1) logError $op "Missing one of: major, course, lp, or section" ;;
+        2|3)
+           major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          ;;
+          
+        *) tooMany 3 $argCount ;;   
+      esac
+      ;;
+      
+    del-lp-cat*)          ## [egory] '<course>' '<lp>' '<category>' - delete a learning plan category  TBD
+      ;;
+      
+    del-lp-sec*)          ## [tion] '<course>' '<lp>' - delete a learning path section  TBD
+      ;;
+      
+    get-lp)               ## ['<course>'] - get learning paths for course 
+      case $argCount in
+        0)    
+          gettr courses | jq '.[] | { id, code, title }' | $mlrP | (
+            read dummy
+            
+            while read cId code crs ; do
+              echo "Course: Id: $cId Code: $code Name: $crs"
+              gettr course/$code/learningpaths | jq -rc '.[] | { id, name }' 2>&1 | $mlrP 2>&1 |\
+                 grep -v assertion | grep -v "Unable to parse"
+            done )
+          ;;       
+
+        1)
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"`
+          gettr course/$cc/learningpaths | jq -cr '.[] | { id, name }'  2>&1 | $mlrP 2>&1  | grep -v "Unable to parse"
+          ;;
+
+        *) tooMany "0-1" $argCount ;;
+      esac
+      ;;
+      
+    get-lp-cat*)          ## [egory] [ '<course>' ] - get learning path categories for a course 
+      case $argCount in
+        0)
+          gettr courses | jq -cr '.[] | { id, code, title }' | $mlrT | tail -n +2 > $tmpC
+
+          while read cId code title ; do
+            echo "Course: $cId $code $title"
+            gettr course/$code/learningpaths/categories | \
+                jq '.[]? | { id, c_id, position, name }' 2>&1 | $mlrT 2>&1 | cvt t2m | \
+                grep -v failed | grep -v 'Unable to parse JSON data'
+          done < $tmpC
+          
+          rm $tmpC
+          ;;
+
+        1) 
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"` 
+          gettr course/$cc/learningpaths/categories | jq -c '.[] | { id, position, name }' | $mlrT
+          ;;
+
+        *) tooMany "0-1" $argCount ;;
+      esac
+      ;;
+    
+    get-lp-doc*)          ## [ument] '<course>' '<lp>' - get learning path documents
+      case $argCount in
+        0) logError $op "Missing: course or learningpath" ;;
+        1) 
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"`
+          
+          gettr course/$cc/learningpaths | jq -r '.[] | { id } ' | $mlrP | {
+            read dummy
+            
+            while read lpId ; do 
+              gettr course/$cc/learningpath/$lpId/documents | jq -rc '.[] | { id, type, title, path } ' | $mlrT | sed -e 's/\/home\/.*learning_path\///' 
+            done
+          }
+          ;;
+          
+        2)
+          course="${args[$firstArg]}"
+          lp="${args[$((++firstArg))]}"
+          cc=`getCourseCode "$course"`
+          lpId=`gettr course/$cc/learningpaths | jq -rc '.[] | {id, name}' | $mlrP | grep "$lp" | cut -d ' ' -f 1`
+          gettr course/$cc/learningpath/$lpId/documents | jq -rc '.[] | { id, type, title, path } ' | sed -e 's/\/home.*learning_path\///g' | $mlrT
+          ;;
+        *) tooMany "2" $argCount ;;
+      esac
+      ;;
+    
+    get-lp-sec*)          ## [tion] [ '<course>' [ '<lp>' ] ] - get learning path table
+      case $argCount in
+        0) # for each course get lps
+          gettr courses | jq -cr '.[] | { title }' | $mlrT | tail -n +2 | (
+            while read title ; do
+              exeOp $bug get-lp-sec "$title"
+            done )
+          ;;
+          
+        1) # given course get all lps        
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"`
+          echo "# Course: $course "
+
+          # for each learning path
+          gettr course/$cc/learningpaths | jq -rc '.[] | { id, name }' 2>&1 |\
+              $mlrP 2>&1 | grep -v 'failed' | grep -v 'Unable to parse JSON data' | (
+            read dummy
+            
+            while read id lp ; do
+              if [ $id != id ] ; then
+                exeOp $tim $bug get-lp-sec "$course" "$lp"
+              fi
+            done )    
+          ;;
+          
+        2) # given course and lp
+          course="${args[$firstArg]}"
+              lp="${args[$((++firstArg))]}"
+
+          declare -A doc
+          
+          exeOp -s get-lp-doc "$course" "$lp" > $tmpA
+             
+          while IFS=$'\t' read id type title path ; do
+            doc[$id]="$path"
+          done < $tmpA
+              
+          exeOp $tim $bug get-doc-list "$course" > "$tmpC-docs"
+          cc=`getCourseCode "$course"`
+          lpId=`gettr course/$cc/learningpaths | jq -rc '.[] | {id, name}' | $mlrP | grep "$lp" | cut -d ' ' -f 1`
+          
+          gettr course/$cc/learningpath/$lpId/items | \
+              jq -rc '.[] | { parent, iId, display_order, name }' | $mlrP 2>&1 |\
+                  grep -v "Unable to parse" > "$tmpL"
+
+          declare -A hash 
+          hash[0]="0 0 $lp"
+          
+          # to be able to look up parents, hash by items id 
+          while read parentId iId display_order name ; do
+            if [ "x$parentId" != "xparent" ] ; then
+              hash[$iId]="$parentId $display_order $name" 
+            fi
+          done < "$tmpL"
+ 
+# debug Dump hash 
+#for key in ${!hash[@]} ; do  
+#  echo "hash[ $key ] = ${hash[$key]}"
+#done
+  
+          echo "## Learning_Path: $lp
+
+| Order | Container | Item | Asset |
+| ----- | --------- | ---- | ----- |"
+      
+          for key in ${!hash[@]} ; do
+            if [ "$key" != "0" ] ; then
+              stripped=${hash[$key]}
+              set x $stripped
+              shift
+              pId=$1
+              iId=$key
+              o=$2
+              shift 2
+              c="$*"
+           
+              set x ${hash[$pId]}
+              shift 3
+              p="$*"
+
+              a="${doc[$iId]}"
+              a="${a:--}"
+                          
+              echo "| $o | $p | $c | $a |"              
+             #echo "| $o | $p $pId | $c $iId | $a |"           # debug    
+            fi
+          done
+         
+          echo        
+          rm "$tmpL" "$tmpA" "$tmpC-docs"
+          ;;
+          
+        *) tooMany "0-2" $argCount ;;
+      esac
+      ;;
+
+# --- Audited get-? to here ---
+
+# Resources
+    add-resource-a)       ## [ll] '<major>' '<course>' - add resource  TBD
+       ;;
+      
+    del-res*)             ##  [ource] '<res>' - delete a resource  TBD
+      ;;
+      
+    get-res-desc*)        ## [ription] ['<major>'] '<course>' - get the course description components of a course
+      case $argCount in
+        0) logError $op "Missing: course" ;;
+        1|2)
+          if [ $argCount -eq 1 ] ; then
+            course="${args[$firstArg]}"
+          else
+            major="${args[$firstArg]}"
+            course="${args[$((++firstArg))]}"
+            c=`echo "$course" | cleanCourse`
+            path="$vault/Majors/${major// /-}/Courses/$c"
+            mkdir -p "$path/Descriptions"
+          fi
+          
+          cc=`getCourseCode "$course"`
+          gettr course/$cc/resources > $tmpR
+          
+          cat $tmpR | jq '.resources."Tool introduction"[]? | { id, intro_text }' | deJson | deNL | {
+            while read typ txt ; do
+              case "$typ" in
+                "id") fileId=$txt;;
+                "intro_text")
+                  if [ $argCount -eq 1 ] ; then
+                    echo "--- Descriptions/$fileId.md ---"
+                    echo "$txt" | deSpan | cvt h2m | deQuote  
+                  else
+                    echo "$txt" | deSpan | cvt h2m | deQuote > "$path/Descriptions/$fileId.md"
+                  fi
+                  ;;
+              esac
+            done
+          }     
+
+          cat $tmpR | jq -r '.resources.course_description? | .[]? | { source_id, title, content }' | deJson | {
+            while read -r op val ; do        
+              case $op in
+                "id")
+                  sId="$val"
+                  ;;
+                  
+                "title")
+                  ttl=`echo ${val} | sed -e 's/",$//;s/^"//'`
+                  fle="${ttl// /-}"
+                  ;;
+                  
+                "content")
+                  con=`echo ${val} | sed -e 's/"$//;s/^"//'`
+                  echo "   --- getting $fle"
+                  mkdir -p "$path"
+                  echo "$con" | sed -e 's/^.*": "//;s/\",$//' | deQuote | deSpan | deNL  | \
+                     cvt h2m | deEsc > "$path/Descriptions/${fle}.md"
+                  ;;
+                  
+              esac
+            done 
+          }
+          
+          cat $tmpR | jq '.resources.glossary[] | { name, description }' | deQuote | deNL | \
+              $mlrT | cvt t2m > "$path/Glossary_Items.md"
+          ;;
+           
+        *) tooMany "2" $argCount ;;  
+      esac
+      ;;
+
+    get-res-doc*)         ## [ument] '<course>' - get the course document names of a course
+      case $argCount in
+        0) logError $op "Missing: code" ;;
+        1)
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"`
+      
+          gettr course/$cc/resources | jq -c '.resources[] | .[] | select( .type == "document") | { type, source_id, title, file_type, size, path }'
+          ;;
+        *) tooMany "1" $argCount ;;
+      esac
+      ;;
+      
+    get-res*)             ## [ource] [ '<course>' ] - get list of resources for 1 or all courses  
+      case $argCount in
+        0)
+          gettr courses | jq -cr '.[] | { title }' | $mlrP | (
+            read dummy
+            
+            while read title ; do
+              echo "  --- course $title ---"
+              exeOp $bug get-res "$title"
+            done )
+          ;;
+          
+        1)
+          course="${args[$firstArg]}"
+          cc=`getCourseCode "$course"`                             # type,                  title, file_type, size, path, content
+          gettr course/$cc/resources | jq -c '.resources[] | .[] | { type, tool, source_id, title, file_type, size, path, content, audio }' 
+         #gettr course/$cc/resources | jq -c '.resources[] | .[] | { type, tool, source_id, title,                  path, content, audio }' # | $mlrP
+          ;;
+
+        *) tooMany "0-1" $argCount ;;
+      esac
+      ;;
+  
+# Scorm Files
+    add-sco*)             ## [rm] '<major>' '<course>' '<version>' <maxScore> - extract from obsidian and upload to chamilo
+      case $argCount in
+        0|1|2|3) logError $op "Missing: major course or version" ;;
+         
+        4)
+             major="${args[$firstArg]}"
+            course="${args[$((++firstArg))]}"
+           version="${args[$((++firstArg))]}"
+          maxScore="${args[$((++firstArg))]}"
+          
+          c=`echo "$course" | cleanCourse`
+          zip="-z"
+          path="$vault/Majors/${major// /-}/Courses/$c"
+
+          etl $bug $zip -u "$path" "$course" "$version" $maxScore
+          ;;
+          
+        *) tooMany 4 $argCount ;;
+      esac    
+      ;;
+      
+    get-sco*)             ## [rm] '<major>' '<course>' - get scorm file from Chamilo then unpack it and place into obsidian 
+      case $argCount in
+        0) logError $op "Missing: major" ;;
+        1) logError $op "Missing: course title" ;;
+        
+        2)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          c=`echo "$course" | cleanCourse`
+          
+          mkdir -p "$tmpS"
+          sco="$tmpS/sco.zip"
+          path="Majors/${major// /-}/Courses/$c"
+          
+          cc=`getCourseCode "$course"`
+
+          gettr course/$cc/learningpaths | jq -cr '.[] | { id, name }' 2>&1 | $mlrP 2>&1  | grep -v "Unable to parse" | (
+            read dummy
+            
+            while read lpId title ; do
+              echo "--- about to export course: '$course' lp: '$title' ---"
+              gettr course/$cc/learningpath/$lpId/scorm > "$sco"  
+  #           gettr course/$cc/learningpath/$lpId/scorm > "$sco.$lpId"              
+              unpk $bug "$sco" "$vault/$path" "Documents/Learning_Paths/${title// /-}"
+            done )
+          ;;
+          
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+      
+# Tests    
+    add-t*)               ## [est] '<major>' '<course>' '<file>' [ '<lp>' ] - add a test to a course optional learning path
+      case $argCount in
+        0) logError $op "Missing: major course and file"  ;;
+        1) logError $op "Missing: course and file" ;;
+        2) logError $op "Missing: file"   ;;
+        
+        3|4)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          file="${args[$((++firstArg))]}"
+          
+          m="${major// /-}"
+          c="${course// /-}"
+          testDir="$vault/Majors/$m/Courses/$c"
+          # mkdir -p "$testDir"
+          testFile="$testDir/$file"
+          cc=`getCourseCode "$course"`
+          
+          if [ ! -d "$testDir" ] ; then
+            logError $op "Course: '$course' is not defined. Cannot add tests to undefined course."
+          fi
+        
+          if [ ! -f "$testFile" ] ; then
+            logError $op "Cannot open: $testFile"
+          fi
+          
+          if [ $argCount -eq 4 ] ; then
+            lp="$4"
+            lpid=`gettr course/$cc/learningpaths | jq -rc .[] | grep "$lp" | mlr --ijson --oxtab`
+          fi
+          
+          isTest=no
+          state=out               
+          tId=na
+          qId=na
+          aId=na
+          
+          while read row ; do
+            #echo $state $row
+            
+            case $state in
+              "out")
+                case $row in
+                  *"Test:"*) state=in ; ready=test     ;;  
+                esac
+                ;;
+
+              "in")
+                case $row in
+                  *"Test:"*) state=in ; ready=test     ;;
+                  *"Question:"*)        ready=question ;;
+                  *"Answer:"*)          ready=answer   ;;
+                  '| iid'*)                            ;;
+                  '|-'*)                               ;;
+                    
+                  '|'*) # data row of type ready
+                    #echo "decode row: $row"
+                    tight=`echo "$row" | sed -e 's/ | /|/g;s/| /|/g;s/ |/|/g'`
+                    IFS='|' read -r -a ary <<< "$tight"
+                    
+                    case $ready in
+                      "test")
+                        #     1    2       3         4    5     6          7          8           9            10                    
+                        #   {iid,title,description,sound,type,random,random_answers,active,results_disabled,max_attempt,
+                        #          11             12                 13                 14                 15 
+                        #    feedback_type,random_by_category,text_when_finished,pass_percentage,question_selection_type, 
+                        #            16
+                        #    ide_question_title}
+
+                        ary[3]=`blank "${ary[3]}" | deStyle | escDblQuote`
+                        ary[13]=`blank "${ary[13]}" | deStyle | escDblQuote`
+                        ttl="${ary[2]}"
+                        ttl="${ttl/ ([0-9.]*)}"
+                        desc="${ary[3]}"
+                        echo "   --- Adding Test: '${ttl}' '${desc:0:30}'"
+                        
+                        payload="
+                          {
+                            \"title\":                \"${ttl}\",
+                            \"description\":          \"${ary[3]}\",
+                            \"type\":                   ${ary[5]},
+                            \"random\":                 ${ary[6]},
+                            \"random_answers\":         ${ary[7]},
+                            \"results_disabled\":       ${ary[9]},
+                            \"feedback_type\":          ${ary[11]},
+                            \"attempts\":               ${ary[10]},
+                            \"randomByCat\":            ${ary[12]},
+                            \"text_when_finished\":     ${ary[13]}, 
+                            \"pass_percentage\":        ${ary[14]},
+                            \"questionSelectionType\":  ${ary[15]},
+                            \"hideQuestionTitle\":      ${ary[16]}
+                          }"
+echo "$payload"                          
+                        res=`puttr course/$cc/test $payload | jq '. | { iid, title }' | grep iid | deJson`
+echo "test result: $res"
+
+                        set x $res
+                        tId=$3
+                        ;;
+
+                      "question")
+#set -x                      
+                        #    1      2          3            4                5
+                        # { iid, question, description, typePicture, explanationLangVar,
+                        #       6         7        8     9      10 
+                        #   weighting, position, type, level, picture, 
+                        #      11        12         13          14      
+                        #   category, mandatory, isContent, feedback }
+                        ttl=`blank "${ary[2]}" | deStyle | escDblQuote`
+                        ttl="${ttl/ ([0-9.]*)}"
+                        ary[3]=`blank "${ary[3]}" | deStyle | escDblQuote`
+                        desc="${ary[3]}"
+echo "      --- Adding Question: '${ttl}' '${desc:0:30}'"
+                        payload="
+                          { 
+                            \"title\":       \"${ttl}\", 
+                            \"type\":          ${ary[8]}, 
+                            \"description\":   ${ary[3]}, 
+                            \"ponderation\":   ${ary[6]}, 
+                            \"picture\":     \"${ary[10]}\",
+                            \"level\":         ${ary[9]}, 
+                            \"category\":      ${ary[11]}, 
+                            \"feedback\":    \"${ary[14]}\" 
+                          }"
+
+#puttr course/$cc/test/$tId/question $payload | jq '. | { iid, question } ' | grep iid | deJson
+#exit                        
+                        ret=`puttr course/$cc/test/$tId/question $payload | jq '. | { iid, question }' | grep iid | deJson`
+                        set x $ret
+                        qId=$3
+
+                        if [ "x$qId" == "x-" ] ; then
+                          puttr course/$cc/test/$tId/question $payload
+                        fi  
+#set +x
+                        ;;
+
+                      "answer")
+                        #    1      2       3        4          5 
+                        # { iid, answer, correct, comment, ponderation, 
+                        #      6              7                 8             9           10
+                        #   position, hotspot_coordinates, hotspot_type, destination, answer_code }
+                        ttl=`blank "${ary[2]}" | deStyle | escDblQuote`
+                        ttl="${ttl/ ([0-9.]*)}"
+                        ary[4]=`blank "${ary[4]}" | deStyle | escDblQuote`
+  # TBD fails on 3 of hundreds.
+                        payload="
+                          { 
+                            \"title\":               \"${ttl}\",
+                            \"correct\":               ${ary[3]},
+                            \"ponderation\":           ${ary[5]},
+                            \"comment\":             \"${ary[4]}\", 
+                            \"position\":              ${ary[6]}"
+                            
+                        if [ -n "${ary[7]}" ] ; then
+                          payload="$payload,                      
+                            \"hotspot_coordinates\": \"${ary[7]}\", 
+                            \"hotspot_type\":        \"${ary[8]}\"" 
+                        fi
+                        
+                        #desc="${ttl}"
+echo "         --- Adding Answer: '${ttl:0:30}'"                         
+                        payload="$payload,
+                            \"destination\":         \"${ary[9]}\"
+                          }" 
+                          
+   # echo "Sending: $payload"                       
+                        puttr course/$cc/test/$tId/question/$qId/answer  "$payload" > /dev/null                          
+                        ;;
+                    esac
+                    ;;
+
+                  "")
+                    ;;
+
+                  *)
+                    echo "Unexpected: $row"
+                    ;;
+                esac
+                ;;
+            esac
+          done < "$testFile"   
+          ;;
+        
+        *) tooMany "0-1" $argCount ;;
+      esac
+      ;;
+      
+    del-t*)               ## '<course>' ['<test>'] - delete a test or all tests from a course  TBD
+      ;;
+
+    get-t*)               ## [est] [ [ '<major>' ] '<course>' ] [all] - get test list or test 
+      case $argCount in
+        0) # get test attributes for all courses +
+          gettr courses | jq -cr '.[] | { id, code, title }' | $mlrC | (
+            read dummy
+            
+            while read course ; do
+            set x ${course//,/ }
+            shift
+            id=$1
+            code=$2
+            shift 2
+            echo "--- Course: |$id|$code|$*| ---"
+            gettr course/$code/tests | jq '.[]' 2>&1 | grep -v assertion | $mlrP
+          done )
+          ;;
+          
+        1) 
+          if [ "x$1" = "xall" ] ; then # get all complete tests for all courses
+            gettr courses | jq -cr '.[] | { id, code, title }' | $mlrP | (
+              read dummy
+              
+              while read id code title ; do
+                unwindTests $code 
+              done   
+            )
+          else # get all test ids and names for a course +
+            course="${args[$firstArg]}"
+            code=`getCourseCode "$course"`
+
+            gettr course/$code/tests | jq '.[] | { iid, title }' 2>&1 | grep -v assertion | $mlrP
+          fi
+          ;;
+
+        2) 
+            major="${args[$firstArg]}"
+            course="${args[$((++firstArg))]}"
+            c=`echo "$course" | cleanCourse`
+            code=`getCourseCode "$course"`
+#            echo "Getting all complete tests for course: $course"
+#            path="$vault/Majors/$major/Courses/$c"
+#            mkdir -p "$path"
+#            echo "Placing results in $path/Tests.md"
+            unwindTests $code "$course" # > "$path/Tests.md"
+          ;;    
+
+        *) tooMany "0-3" $argCount ;;
+      esac
+      ;;  
+     
+# Questions in Tests
+    add-q*)               ## [uestion] '<course>' '<test>' - add a question to a test  TBD
+      ;;
+
+    get-q*)               ## [uestion] '<course>' '<test>' - get test questions
+      case $argCount in
+        0) logError $op "Missing: course" ;;
+        1) logError $op "Missing: test"   ;;
+
+        2) # get all questions for a course test +
+          course="${args[$firstArg]}"
+            test="${args[$((++firstArg))]}"
+          code=`getCourseCode "$course"`
+
+          gettr course/$code/tests | jq -c '.[] | { iid, title } ' | $mlrP | (
+            read dummy
+            
+            while read id ttl ; do
+              if [ "x$ttl" == "x$test" ] ; then
+                gettr course/$code/test/$id/questions | jq -c '.[] | {typePicture, iid, weighting, category, question }' | $mlrP
+              fi
+            done )
+          ;;
+
+        *) tooMany "2" $argCount ;;
+      esac
+      ;;
+
+# Answers to Questions
+    add-a*)               ## '<course>' '<test>' '<question>' '<answer>' - add a test question answer  TBD
+      ;;
+
+    get-a*)               ## '<course>' '<test>' '<question id>' - get test answers 
+      case $argCount in
+        0) logError $op "Missing: course"      ;;
+        1) logError $op "Missing: test"        ;;
+        2) logError $op "Missing: question Id" ;;
+        
+        3)            
+          course="${args[$firstArg]}"
+            test="${args[$((++firstArg))]}"
+             qid="${args[$((++firstArg))]}"
+          code=`getCourseCode "$course"`
+
+          tid=`gettr course/$code/tests | jq '.[] | { iid, title }' 2>&1 |\
+              grep -v assertion | $mlrP | grep "$test" | cut -d ' ' -f 1`
+
+          gettr course/$code/test/$tid/question/$qid/answers | jq -c '.[] | { answer, correct, comment, ponderation, position, hotspot_coordinates, hotspot_type, destination, answer_code }' |\
+              sed -e 's~\\r\\n~<br />~g' #| $mlrP 
+          ;;
+
+        *) tooMany "0-3" $argCount ;;
+      esac
+      ;;
+
+# Config Files
+    edit-con*)            ## [fig] - edit config file for c2o 
+      case $argCount in
+        0) 
+          edit=`getInfo editor ~/.c2o.config`
+          cd 
+          $edit .c2o.config ;;
+        *) tooMany 1 $argCount ;;
+       esac
+      ;;
+
+    edit-course-con*)     ## [figuration] '<major>' '<course>' - edit class config file 
+      case $argCount in
+        0) logError $op "Missing: major" ;;
+        1) logError $op "Missing: course" ;;
+        2) 
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          
+          major="${major// /-}"
+          course="${course// /-}"
+          edit=`getInfo editor ~/.c2o.config`
+          cd 
+          $edit "$vault/Majors/$major/Courses/$course/Info.md"
+          ;;
+          
+        *) tooMany 2 $argCount ;;
+      esac
+      ;;
+      
+    get-conf*)            ## [iguration] -  show chamilo config file
+      cat ~/.c2o.config
+      ;;
+      
+# Utility Functions    
+    gettr|puttr)          ## '<endpoint>' - Access GET or POST API with only endpoint
+      case $argCount in
+        0)   logError $op "Missing: endpoint." ;;
+        1|2) $op "${args[$firstArg]}" "${args[$((++firstArg))]}" ;;
+        *)   tooMany 1 $argCount ;;
+      esac
+      ;;
+      
+    putti)                ## '<endpoint> <file>' - Access POST image API with only endpoint and file  TBD
+      case $argCount in
+        0)   logError $op "Missing: endpoint." ;;
+        1|2) putti $* ;;   # "course/$cc/documents/image" "$file"
+        *)   tooMany 1 $argCount ;;
+      esac
+      ;;  
+      
+    puttf)                ## <endpoint> '<file>' '<path>' '<title>' '<comment>' - POST file API 
+      case $argCount in
+        0|1|2|3) logError $op "Missing: endpoint, file, path, and title." ;;
+        4|5)     puttf "${args[$firstArg]}" "${args[$((++firstArg))]}" \
+                     "${args[$((++firstArg))]}" "${args[$((++firstArg))]}" "${args[$((++firstArg))]}" ;;
+        *)       tooMany 5 $argCount ;;
+      esac
+      ;;  
+
+    unpk-zipped)          ## '<zip>' '<vault>' - extract files from Chamilo scorm file place into obsidian vault 
+      case $argCount in
+        0|1) logError $op "Missing: arguments." ;;
+        2)  
+          filePath="$tmpS"
+  #       zip="$tmpS/7_PRACTICECOURSE_20220316-122148.zip"
+          zip="$tmpS/_Figures-of-Speech-in-the-Bible.zip"
+          unpk $bug "$zip" "$filePath" 
+          ;;
+      esac
+      ;;
+      
+# Backups
+    get-back*)            ## [up] '<major>' '<course>' - get backup from chamilo then unpack it and place into obsidian 
+      case $argCount in
+        0) logError $op "Missing: major" ;;
+        1) logError $op "Missing: course title" ;;
+        
+        2|3)
+          major="${args[$firstArg]}"
+          course="${args[$((++firstArg))]}"
+          
+          c=`echo "$course" | cleanCourse`
+          mkdir -p "$tmpS"
+          path="Majors/$major/Courses/$c"
+          #path="${pth// /-}"
+          cc=`getCourseCode "$course"`
+          echo "--- about to get backup of $course from Chamilo... ---"
+          
+          if [ $argCount -eq 2 ] ; then
+            gettr course/$cc/backup > "$tmpB"
+          fi
+          
+          unpk $bug "$tmpB" "$vault/$path" "Documents/Learning_Paths"     
+  #        rm -rf $tmpB
+          ;;
+          
+      esac
+      ;;
+      
+# Users    
+    get-u*)               ## [ser] [ '<username>' ] - get users or user
+      case $argCount in  
+        0) getUserId ;;
+        1) 
+          username="${args[$firstArg]}"        
+          getUserId $username
+          ;;
+        *) tooMany 0-1 $argCount ;;
+      esac
+      ;;
+    
+    *)
+      logError "u~a" "Unknown operation: $op"
+      ;;
+  esac
+}
+
+startDate=`date +%s`
+
+# Common constants
+  mlr="mlr --ijson --o"
+  mlrC="${mlr}csv    cat"
+  mlrP="${mlr}pprint cat"
+  mlrT="${mlr}tsv    cat"
+
+  tmpBase="/tmp"
+  tmpA="$tmpBase/tmpAssets"
+  tmpB="$tmpBase/tmpBackup.zip"
+  tmpC="$tmpBase/tmpCourses" 
+  tmpL="$tmpBase/tmpLps"
+  tmpS="$tmpBase/tmpLpScorm"
+  tmpH="$tmpBase/tmpHtml"
+  tmpK="$tmpBase/tmpKeys"
+  tmpR="$tmpBase/tmpRes"
+  
+  host=`getInfo host  ~/.c2o.config`
+   api=`getInfo api   ~/.c2o.config`
+ vault=`getInfo vault ~/.c2o.config`
+   cwd=`pwd`
+ token=`getToken`
+    cc=
+   bug=
+ timer=yes
+ 
+  argIdx=0
+  declare -A args
+
+while [ $# -gt 0 ] ; do
+  args[$argIdx]="$1"
+  (( argIdx++ ))
+  shift
+done
+
+exeOp
+
+if [ "x$timer" == "xyes" ] ; then
+  report $op $startDate >&2
+fi

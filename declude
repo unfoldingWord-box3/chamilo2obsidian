@@ -1,0 +1,45 @@
+#!/bin/bash
+########################################################################
+#
+# NAME  declude  -  undo any included files in this html file
+#
+# DESCRIPTION Walk through file on stdin looing for transcludes. 
+#      Write ref to transclude to stdout then skip it all to end of 
+#      current transclude Note transcludes can include transcludes so 
+#      we have to find the end of this one.
+#
+  USAGE="... | declude | ..."
+#
+########################################################################
+
+if [ "x$1" = "x-h" ] ; then
+  cat $0 | helper
+  exit
+fi
+
+status=out
+file=none
+
+while read lne ; do
+  case $status in
+    in)
+      case $lne in
+        *"end transclude $file"*) status=out ;;
+      esac
+      ;;
+
+    out)
+      case $lne in
+        *transclude*) 
+          set x $lne 
+          file=$4
+          echo '![['$file']]'
+          status=in
+          ;;
+
+        *) echo $lne ;;
+      esac
+      ;;
+  esac
+done
+

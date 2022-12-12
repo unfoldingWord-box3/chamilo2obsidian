@@ -1,0 +1,28 @@
+#!/bin/bash
+########################################################################
+#
+# NAME  md2tsv - convert markdown table to tsv 
+#
+# DESCRIPTION Read standard in expecting simple mardown table
+#       Replace vertical bars with tabs and delete 2nd row
+#
+  USAGE="... | md2tsv | ...
+  Ex:
+    grep '\|' infile | md2tsv"
+#
+########################################################################
+
+if [ "x$1" = "x-h" ] ; then
+  cat $0 | helper
+  exit
+fi
+
+frst=yes
+
+while read ln ; do
+  if [ x"${ln:0:2}" != 'x|-' ] ; then
+    echo "$ln" | sed -e 's/^|//;s/|/\t/g'
+  fi
+done
+
+
